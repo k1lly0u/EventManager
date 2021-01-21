@@ -1,918 +1,690 @@
 ﻿// Requires: EventManager
+using Network;
+using Newtonsoft.Json;
+using Oxide.Plugins.EventManagerEx;
 using System;
+using System.Collections;
 using System.Collections.Generic;
-using Oxide.Game.Rust.Cui;
-using Oxide.Core.Plugins;
-using UnityEngine;
 using System.Linq;
+using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Slasher", "k1lly0u", "0.2.12", ResourceId = 1662)]
-    class Slasher : RustPlugin
+    [Info("Slasher", "k1lly0u", "0.3.0"), Description("Team Deathmatch event mode for EventManager")]
+    class Slasher : RustPlugin, IEventPlugin
     {
-        #region Fields
-        [PluginReference] EventManager EventManager;
-        [PluginReference] Plugin Spawns;
+        private string[] _torchItems = new string[] { "torch", "flashlight.held" };
+        private string[] _validWeapons;
 
-        static Slasher instance;
-        static string SlasherClock = "SlasherClockUI";
-        static string SlasherPopup = "SlasherPopupUI";
+        private long _midnightTime;
+        private long _middayTime;
 
-        private bool usingSlasher;
-        private bool hasStarted;
-        private bool isOpen;
-        private bool justLaunched;
-        private bool gameEnding;
+        private const string WEAPON_FLASHLIGHT_ITEM = "weapon.mod.flashlight";
 
-        private int roundNumber;
+        private static EnvSync EnvSync;
 
-        private string playerSpawns;
+        private static Slasher Instance;
 
-        private RoundTimer roundTimer;
-        private Timer cancelTimer;
-        private EventManager.Events defaultEvent;
-
-        private List<SlasherPlayer> SlasherPlayers;
-        private BasePlayer nextSlasher;      
-        #endregion
+        private static List<BasePlayer> EventPlayers;
 
         #region Oxide Hooks
-        void Loaded()
+        private void Loaded()
         {
-            usingSlasher = false;
-            hasStarted = false;
-            isOpen = false;
-            justLaunched = false;
-            roundNumber = 0;
-            SlasherPlayers = new List<SlasherPlayer>();
-            nextSlasher = null;
-        }
-        void OnServerInitialized()
-        {
-            LoadVariables();
-            //RegisterGame();
-            instance = this;            
-        }
-        void Unload()
-        {
-            UnityEngine.Object.Destroy(roundTimer);
-            var objPlayers = UnityEngine.Object.FindObjectsOfType<SlasherPlayer>();
-            if (objPlayers != null)
-                foreach (var gameObj in objPlayers)
-                    UnityEngine.Object.Destroy(gameObj);
-            if (cancelTimer != null)
-                cancelTimer.Destroy();
-            foreach (var player in BasePlayer.activePlayerList)
-                CuiHelper.DestroyUi(player, SlasherClock);
-        }
-        void OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
-        {
-            try
-            {
-                var victim = entity.ToPlayer();
-                if (victim != null)
-                if (usingSlasher && hasStarted)
-                {
+            Instance = this;
 
-                }
-            }
-            catch { }
-        }
-        #endregion
+            _middayTime = new DateTime().AddHours(12).ToBinary();
+            _midnightTime = new DateTime().ToBinary();
 
-        #region EventManager Hooks
-        private void UpdateScores() 
-        {
-            if (usingSlasher && hasStarted && configData.EventSettings.ShowScoreboard)
-            {
-                var sortedList = SlasherPlayers.OrderByDescending(pair => pair.kills).ToList();
-                var scoreList = new Dictionary<ulong, EventManager.Scoreboard>();
-                foreach (var entry in sortedList)
-                    if (!scoreList.ContainsKey(entry.player.userID))
-                        scoreList.Add(entry.player.userID, new EventManager.Scoreboard { Name = entry.player.displayName, Position = sortedList.IndexOf(entry), Score = entry.kills });
-                EventManager.UpdateScoreboard(new EventManager.ScoreData { Additional = null, Scores = scoreList, ScoreType = "Kills" });
-            }
+            EventPlayers = Facepunch.Pool.GetList<BasePlayer>();
+
+            Unsubscribe(nameof(CanNetworkTo));
         }
-        void RegisterGame()
+
+        private void OnServerInitialized()
         {
-            EventManager.Events eventData = new EventManager.Events
-            {
-                CloseOnStart = false,
-                DisableItemPickup = true,
-                EnemiesToSpawn = 0,
-                EventType = Title,
-                GameMode = EventManager.GameMode.Normal,
-                GameRounds = 0,
-                Kit = null,
-                MaximumPlayers = 0,
-                MinimumPlayers = 2,
-                ScoreLimit = 0,
-                Spawnfile = configData.GameSettings.DefaultSpawnfile,
-                Spawnfile2 = null,
-                SpawnType = EventManager.SpawnType.Consecutive,
-                RespawnTimer = 10,
-                RespawnType = EventManager.RespawnType.Timer,
-                UseClassSelector = false,
-                WeaponSet = null,
-                ZoneID = configData.EventSettings.DefaultZoneID                
-            };
-            defaultEvent = eventData;
-            EventManager.EventSetting eventSettings = new EventManager.EventSetting
-            {
-                CanChooseRespawn = false,
-                CanUseClassSelector = false,
-                CanPlayBattlefield = false,
-                ForceCloseOnStart = false,
-                IsRoundBased = false,
-                LockClothing = true,
-                RequiresKit = false,
-                RequiresMultipleSpawns = false,
-                RequiresSpawns = true,
-                ScoreType = null,
-                SpawnsEnemies = false
-            };
-            var success = EventManager.RegisterEventGame(Title, eventSettings, eventData);
-            if (success == null)
-            {
-                Puts("Event plugin doesn't exist");
-                return;
-            }
-            if (configData.GameSettings.AutoStart_Use)
-                if (ValidateSettings())
-                    CheckTime();
+            EventManager.RegisterEvent(Title, this);
+
+            GetMessage = Message;
+
+            EnvSync = GameObject.FindObjectOfType<EnvSync>();
+
+            FindValidWeapons();
         }
-        void OnSelectEventGamePost(string name)
+
+        protected override void LoadDefaultMessages() => lang.RegisterMessages(Messages, this);
+
+        private object CanNetworkTo(EnvSync env, BasePlayer player)
         {
-            if (Title == name)
-                usingSlasher = true;
-            else usingSlasher = false;
-        }
-        void OnEventPlayerSpawn(BasePlayer player)
-        {
-            if (usingSlasher && hasStarted && !gameEnding)
-            {                
-                player.health = configData.GameSettings.StartHealth;                
-            }
-        }
-        object CanEventOpen()
-        {
-            if (usingSlasher)
+            if (env == null || player == null || !EventPlayers.Contains(player))
+                return null;
+            
+            if (Net.sv.write.Start())
             {
-                if (!(TOD_Sky.Instance.Cycle.Hour > configData.GameSettings.Auto_StartTime || TOD_Sky.Instance.Cycle.Hour < configData.GameSettings.Auto_EndTime))
-                    return "Slasher can only be played at night time";                
-            }
-            return null;
-        }
-        void OnEventOpenPost()
-        {
-            if (usingSlasher)
-                EventManager.BroadcastToChat("In Slasher, the goal is to hide from the slasher, if you hide long enough you will be given weapons for your chance to take down the slasher");
-            SlasherPlayers.Clear();
-            nextSlasher = null;
-        }
-        void OnEventCancel()
-        {
-            if (usingSlasher && hasStarted)
-                CheckScores(true);
-        }        
-        void OnEventEndPre()
-        {
-            if (usingSlasher && hasStarted)
-            {
-                CheckScores(true);
-                DestroyTimers();
-                
-                foreach (var player in BasePlayer.activePlayerList)
-                    CuiHelper.DestroyUi(player, SlasherClock);
-            }
-        }
-        void OnEventEndPost()
-        {
-            if (usingSlasher)
-            {
-                hasStarted = false;
-                isOpen = false;
-                var slasherPlayers = UnityEngine.Object.FindObjectsOfType<SlasherPlayer>();
-                if (slasherPlayers != null)
+                Connection connection = player.net.connection;
+                connection.validate.entityUpdates = connection.validate.entityUpdates + 1;
+                BaseNetworkable.SaveInfo saveInfo = new BaseNetworkable.SaveInfo
                 {
-                    foreach (var slasher in slasherPlayers)
-                    {
-                        UnityEngine.Object.Destroy(slasher);
-                    }
+                    forConnection = player.net.connection,
+                    forDisk = false
+                };
+
+                Net.sv.write.PacketID(Network.Message.Type.Entities);
+                Net.sv.write.UInt32(player.net.connection.validate.entityUpdates);
+
+                using (saveInfo.msg = Facepunch.Pool.Get<ProtoBuf.Entity>())
+                {
+                    env.Save(saveInfo);
+
+                    saveInfo.msg.environment.dateTime = (EventManager.BaseManager as SlasherEvent).IsPlayingRound ? _midnightTime : _middayTime;
+
+                    saveInfo.msg.ToProto(Net.sv.write);
+                    Net.sv.write.Send(new SendInfo(player.net.connection));
                 }
-                SlasherPlayers.Clear();
             }
-        }
-        void OnEventStartPre()
-        {
-            if (usingSlasher)
-            {
-                justLaunched = true;
-                gameEnding = false;
-                roundNumber = 0;                
-            }
-        }
-        object OnEventStartPost()
-        {
-            if (usingSlasher)
-            {
-                hasStarted = true;
-                UpdateScores();
-                NextRound();
-            }          
-            return null;
-        }
-        void OnEventJoinPost(BasePlayer player)
-        {
-            if (usingSlasher)
-            {
-                if (player.GetComponent<SlasherPlayer>())
-                    UnityEngine.Object.Destroy(player.GetComponent<SlasherPlayer>());
-                SlasherPlayers.Add(player.gameObject.AddComponent<SlasherPlayer>());
-                player.GetComponent<SlasherPlayer>().team = Team.DEAD;
-                EventManager.CreateScoreboard(player);
-                player.inventory.Strip();   
-                if (hasStarted)
-                {
-                    EventManager.AddRespawnTimer(player, "", false, false);
-                }            
-            }
-        }        
-        void OnEventLeavePost(BasePlayer player)
-        {
-            if (usingSlasher && hasStarted)
-            {
-                var slasher = player.GetComponent<SlasherPlayer>();
-                if (slasher != null)
-                {
-                    if (slasher.team == Team.SLASHER)
-                        EndRound();
-                    if (nextSlasher == player) nextSlasher = null;     
-                    SlasherPlayers.Remove(slasher);
-                    UnityEngine.Object.Destroy(player.GetComponent<SlasherPlayer>());
-                    CuiHelper.DestroyUi(player, SlasherClock);
-                    CheckScores();                   
-                }
-            }            
-        }
-        void OnEventPlayerDeath(BasePlayer victim, HitInfo hitinfo) 
-        {
-            if (usingSlasher)
-            {
-                var eventVic = victim.GetComponent<SlasherPlayer>();
-                AddKill(victim, hitinfo?.InitiatorPlayer ?? null);                
-            }
-            return;
+
+            return false;
         }
         
-        object EventChooseSpawn(BasePlayer player, Vector3 destination)
+        private void Unload()
         {
-            if (usingSlasher && hasStarted)
-            {
-                var slasher = player.GetComponent<SlasherPlayer>();
-                if (slasher != null)
-                {
-                    var newPos = EventManager.SpawnCount.GetSpawnPoint(playerSpawns);
-                    if (newPos is Vector3)
-                        return (Vector3)newPos;
-                    else PrintError($"Unable to find a spawnpoint for {player.displayName} on team {slasher.team}");
-                }                
-            }
-            return null;
-        }
-        void SetSpawnfile(bool isPlayerSpawns, string spawnfile)
-        {
-            if (isPlayerSpawns)
-                playerSpawns = spawnfile;
-        }
-        object GetRespawnType()
-        {
-            if (usingSlasher)
-                return EventManager.RespawnType.Timer;
-            return null;
-        }
-        object GetRespawnMsg()
-        {
-            if (usingSlasher)
-                return "You must wait until the round is over";
-            return null;
-        }
-        object FreezeRespawn(BasePlayer player)
-        {
-            if (usingSlasher)
-            {
-                var eventPlayer = player.GetComponent<SlasherPlayer>();
-                if (eventPlayer?.team == Team.DEAD)                
-                    return true;                
-            }
-            return null;
-        }
-        object HasDamageMultiplier(BasePlayer victim, BasePlayer attacker)
-        {
-            if (usingSlasher)
-            {
-                var att = attacker.GetComponent<SlasherPlayer>();
-                var vic = victim.GetComponent<SlasherPlayer>();
+            Facepunch.Pool.FreeList(ref EventPlayers);
 
-                if (att == null || vic == null) return null;
-                var weapon = attacker.GetActiveItem();
-                if (weapon == null) return null;
-                switch (att.team)
-                {
-                    case Team.DEAD:
-                        return null;
-                    case Team.SLASHER:
-                        if (configData.Slashers.Weapon.Shortname == weapon?.info?.shortname)
-                            return configData.Slashers.DamageModifier;
-                        return null;
-                    case Team.HUNTED:
-                        if (configData.Players.Weapon.Shortname == weapon?.info?.shortname)                        
-                            return configData.Players.DamageModifier;                        
-                        return null;
-                }
-            }
-            return null;
+            if (!EventManager.IsUnloading)
+                EventManager.UnregisterEvent(Title);
+
+            Configuration = null;
+            Instance = null;
         }
         #endregion
 
         #region Functions
-        bool ValidateSettings()
+        private void FindValidWeapons()
         {
-            List<string> errorList = new List<string>();
-            var success = EventManager.ValidateSpawnFile(configData.GameSettings.DefaultSpawnfile);
-            if (success is string)            
-                errorList.Add("Spawn file is invalid");
-            success = EventManager.ValidateZoneID(configData.EventSettings.DefaultZoneID);
-            if (success is string)
-                errorList.Add("Zone ID is invalid");
-            if (errorList.Count > 0)
+            List<string> list = Facepunch.Pool.GetList<string>();
+
+            foreach (ItemDefinition itemDefinition in ItemManager.itemList)
             {
-                PrintError("The was a error starting the night time automated Slasher event. You must have valid entries in your config.");
-                foreach (var error in errorList)
-                    PrintError(error);
-                return false;
-            }
-            return true;
-        }
-       
-        void CheckTime()
-        {
-            if (!hasStarted)
-            {
-                var time = TOD_Sky.Instance.Cycle.Hour;
-                if (isOpen)
+                if (itemDefinition.category == ItemCategory.Weapon || itemDefinition.category == ItemCategory.Tool)
                 {
-                    if (time >= configData.GameSettings.Auto_StartTime || (time > 0 && time < configData.GameSettings.Auto_EndTime))
+                    if (!itemDefinition.isHoldable)
+                        continue;
+
+                    AttackEntity attackEntity = itemDefinition.GetComponent<ItemModEntity>()?.entityPrefab?.Get()?.GetComponent<AttackEntity>();
+                    if (attackEntity != null && (attackEntity is BaseMelee || attackEntity is BaseProjectile))
+                        list.Add(itemDefinition.shortname);
+                }
+            }
+
+            list.Sort();
+
+            _validWeapons = list.ToArray();
+
+            Facepunch.Pool.FreeList(ref list);
+        }
+
+        private string[] GetSlasherWeapons() => _validWeapons;
+
+        private string[] GetSlasherTorches() => _torchItems;
+        #endregion
+
+        #region Event Checks
+        public bool InitializeEvent(EventManager.EventConfig config) => EventManager.InitializeEvent<SlasherEvent>(this, config);
+
+        public bool CanUseClassSelector => false;
+
+        public bool RequireTimeLimit => false;
+
+        public bool RequireScoreLimit => false;
+
+        public bool UseScoreLimit => false;
+
+        public bool UseTimeLimit => false;
+
+        public bool IsTeamEvent => false;
+
+        public void FormatScoreEntry(EventManager.ScoreEntry scoreEntry, ulong langUserId, out string score1, out string score2)
+        {
+            score1 = string.Format(Message("Score.Kills", langUserId), scoreEntry.value1);
+            score2 = string.Format(Message("Score.Deaths", langUserId), scoreEntry.value2);
+        }
+
+        public List<EventManager.EventParameter> AdditionalParameters { get; } = new List<EventManager.EventParameter>
+        {         
+            new EventManager.EventParameter
+            {
+                DataType = "string",
+                Field = "torchItem",
+                Input = EventManager.EventParameter.InputType.Selector,
+                SelectMultiple = false,
+                SelectorHook = "GetSlasherTorches",
+                IsRequired = true,
+                DefaultValue = "flashlight.held",
+                Name = "Torch Item"
+            },
+            new EventManager.EventParameter
+            {
+                DataType = "string",
+                Field = "slasherWeapon",
+                Input = EventManager.EventParameter.InputType.Selector,
+                SelectMultiple = false,
+                SelectorHook = "GetSlasherWeapons",
+                IsRequired = false,
+                Name = "Slasher Weapon",
+                DefaultValue = "shotgun.pump"
+            },
+            new EventManager.EventParameter
+            {
+                DataType = "string",
+                Field = "slasherClothing",
+                Input = EventManager.EventParameter.InputType.Selector,
+                SelectMultiple = false,
+                SelectorHook = "GetAllKits",
+                IsRequired = false,
+                Name = "Slasher Clothing"
+            },            
+            new EventManager.EventParameter
+            {
+                DataType = "int",
+                Field = "slasherTime",
+                Input = EventManager.EventParameter.InputType.InputField,
+                IsRequired = true,
+                DefaultValue = 180,
+                Name = "Slasher Timer (seconds)"
+            },
+            new EventManager.EventParameter
+            {
+                DataType = "int",
+                Field = "playerTime",
+                Input = EventManager.EventParameter.InputType.InputField,
+                IsRequired = true,
+                DefaultValue = 120,
+                Name = "Player Timer (seconds)"
+            },
+        };
+
+        public string ParameterIsValid(string fieldName, object value)
+        {
+            switch (fieldName)
+            {
+                case "slasherWeapon":
                     {
-                        if (EventManager.Joiners.Count > 2)
-                        {
-                            if (cancelTimer != null)
-                                cancelTimer.Destroy();
-                            StartEvent();
-                            return;
-                        }
+                        if (ItemManager.FindItemDefinition((string)value) == null)
+                            return "Unable to find a weapon with the specified shortname";
+
+                        return null;
                     }
+                case "slasherClothing":
+                    {
+                        object success = EventManager.Instance.ValidateKit((string)value);
+                        if (success != null)
+                            return (string)success;
+
+                        return null;
+                    }
+                default:
+                    return null;
+            }
+        }
+        #endregion
+
+        #region Event Classes
+        public class SlasherEvent : EventManager.BaseEventGame
+        {
+            private ItemDefinition torchItem;
+            private ItemDefinition slasherWeapon;
+            private string slasherKit;
+
+            private int slasherTime;
+            private int playerTime;
+
+            private int rounds;
+            private int currentRound;
+
+            private EventManager.BaseEventPlayer slasherPlayer;
+
+            private List<EventManager.BaseEventPlayer> remainingSlashers;
+
+            internal bool IsPlayingRound { get; private set; }
+
+            internal override void InitializeEvent(IEventPlugin plugin, EventManager.EventConfig config)
+            {
+                torchItem = ItemManager.FindItemDefinition(config.GetParameter<string>("torchItem"));
+                slasherWeapon = ItemManager.FindItemDefinition(config.GetParameter<string>("slasherWeapon"));
+
+                slasherKit = config.GetParameter<string>("slasherClothing");
+
+                slasherTime = config.GetParameter<int>("slasherTime");
+                playerTime = config.GetParameter<int>("playerTime");
+
+                remainingSlashers = Facepunch.Pool.GetList<EventManager.BaseEventPlayer>();
+
+                base.InitializeEvent(plugin, config);
+            }
+
+            protected override void OnDestroy()
+            {
+                Instance?.Unsubscribe(nameof(Instance.CanNetworkTo));
+
+                Facepunch.Pool.FreeList(ref remainingSlashers);
+
+                EventPlayers.Clear();                
+
+                base.OnDestroy();
+            }
+
+            internal override void PrestartEvent()
+            {
+                CloseEvent();
+                base.PrestartEvent();
+            }
+
+            protected override void StartEvent()
+            {                
+                base.StartEvent();
+
+                Instance.Subscribe(nameof(Instance.CanNetworkTo));
+
+                rounds = eventPlayers.Count;
+
+                remainingSlashers.AddRange(eventPlayers);
+
+                EventPlayers.Clear();
+                EventPlayers.AddRange(eventPlayers.Select((EventManager.BaseEventPlayer eventPlayer) => eventPlayer.Player));
+
+                StartRound();
+            }
+
+            protected override EventManager.BaseEventPlayer AddPlayerComponent(BasePlayer player) => player.gameObject.AddComponent<SlasherPlayer>();
+
+            internal override void LeaveEvent(BasePlayer player)
+            {
+                bool isSlasher = slasherPlayer != null && player.GetComponent<SlasherPlayer>() == slasherPlayer;
+
+                EventPlayers.Remove(player);
+                base.LeaveEvent(player);
+
+                if (isSlasher && Status != EventManager.EventStatus.Finished)
+                    EndRound();
+            }
+
+            #region Event Items
+            protected override void OnKitGiven(EventManager.BaseEventPlayer eventPlayer)
+            {
+                List<Item> list = Facepunch.Pool.GetList<Item>();
+                eventPlayer.Player.inventory.AllItemsNoAlloc(ref list);
+
+                bool isSlasher = eventPlayer == slasherPlayer;
+
+                for (int i = 0; i < list.Count; i++)
+                {
+                    Item item = list[i];
+
+                    if (!isSlasher && item.info.category == ItemCategory.Attire)
+                        continue;
+
+                    item.RemoveFromContainer();
+                    item.Remove();
+                }
+
+                if (isSlasher)
+                {
+                    EventManager.GiveKit(eventPlayer.Player, slasherKit);
+                    GiveSlasherWeapon(eventPlayer);
+                }
+                else GiveTorch(eventPlayer);
+
+                eventPlayer.Player.inventory.SendUpdatedInventory(PlayerInventory.Type.Belt, eventPlayer.Player.inventory.containerBelt);
+            }
+
+            private void GiveSlasherWeapon(EventManager.BaseEventPlayer eventPlayer)
+            {
+                Item item = ItemManager.Create(slasherWeapon);
+
+                if (item.contents != null && item.contents.availableSlots.Count > 0)
+                {
+                    Item attachment = ItemManager.CreateByName(WEAPON_FLASHLIGHT_ITEM);
+                    if (!attachment.MoveToContainer(item.contents))                    
+                        attachment.Remove();   
+                    else item.GetHeldEntity()?.SendMessage("SetLightsOn", true, SendMessageOptions.DontRequireReceiver);
+                }
+                
+                item.MoveToContainer(eventPlayer.Player.inventory.containerBelt);
+
+                BaseProjectile baseProjectile = item.GetHeldEntity() as BaseProjectile;
+                if (baseProjectile != null)
+                {
+                    Item ammo = ItemManager.Create(baseProjectile.primaryMagazine.ammoType, baseProjectile.primaryMagazine.capacity * 5);
+                    ammo.MoveToContainer(eventPlayer.Player.inventory.containerMain);
+                }
+            }
+
+            private void GiveTorch(EventManager.BaseEventPlayer eventPlayer)
+            {
+                Item item = ItemManager.Create(torchItem);
+                item.MoveToContainer(eventPlayer.Player.inventory.containerBelt);
+                item.GetHeldEntity()?.SendMessage("SetLightsOn", true, SendMessageOptions.DontRequireReceiver);
+            }
+
+            protected override bool CanDropBackpack() => false;
+            #endregion
+
+            internal override void OnEventPlayerDeath(EventManager.BaseEventPlayer victim, EventManager.BaseEventPlayer attacker = null, HitInfo info = null)
+            {
+                if (victim == null)
+                    return;
+
+                attacker?.OnKilledPlayer(info);
+
+                if (victim == slasherPlayer || GetAlivePlayerCount() <= 1)
+                {                   
+                    victim.AddPlayerDeath();
+
+                    if (victim == slasherPlayer)
+                        BroadcastToPlayers(GetMessage, "Notification.HuntedWin");
+                    else BroadcastToPlayers(GetMessage, "Notification.SlasherWin");
+
+                    EndRound();
+                    return;
+                }
+
+                victim.OnPlayerDeath(attacker, 0f);
+
+                UpdateScoreboard();
+
+                base.OnEventPlayerDeath(victim, attacker);
+            }
+
+            internal override void GetSpectateTargets(ref List<EventManager.BaseEventPlayer> list)
+            {
+                list.Clear();
+
+                for (int i = 0; i < eventPlayers.Count; i++)
+                {
+                    EventManager.BaseEventPlayer eventPlayer = eventPlayers[i];
+                    if (!eventPlayer.IsDead && eventPlayer != slasherPlayer)
+                        list.Add(eventPlayer);
+                }
+            }
+
+            #region Rounds
+            private void StartRound()
+            {
+                GodmodeEnabled = false;
+
+                IsPlayingRound = true;
+
+                EnvSync.SendNetworkUpdateImmediate();
+
+                currentRound += 1;
+
+                slasherPlayer = GetRandomSlasher();
+
+                StartCoroutine(ResetPlayers());
+
+                Timer.StartTimer(slasherTime, GetMessage("Timer.Slasher", 0UL), OnSlasherTimerExpired);
+
+                BroadcastToPlayers(GetMessage, "Notification.RoundStarted", slasherPlayer.Player.displayName);
+
+                UpdateScoreboard();
+            }
+            
+            private void EndRound()
+            {
+                slasherPlayer = null;
+
+                Timer.StopTimer();
+
+                IsPlayingRound = false;
+
+                GodmodeEnabled = true;
+
+                EnvSync.SendNetworkUpdateImmediate();
+
+                if (currentRound >= rounds)
+                {
+                    Status = EventManager.EventStatus.Finished;
+
+                    StartCoroutine(ResetPlayers());
+                    InvokeHandler.Invoke(this, EndEvent, 5f);
                 }
                 else
                 {
-                    if ((time > configData.GameSettings.Auto_OpenTime && time < 24) || (time > 0 && time < configData.GameSettings.Auto_EndTime))
-                    {
-                        if (!EventManager._Open && !EventManager._Started)
-                        {
-                            if (justLaunched) return;
+                    StartCoroutine(ResetPlayers());
 
-                            EventManager._Event = defaultEvent;
-                            SetSpawnfile(true, defaultEvent.Spawnfile);
-                            SetSpawnfile(false, defaultEvent.Spawnfile2);
-                            EventManager.OpenEvent();
-
-                            isOpen = true;
-                            cancelTimer = timer.Once(configData.GameSettings.Auto_CancelTimer * 60, () =>
-                            {
-                                EventManager.CancelEvent("Not enough players to start the event");
-                                isOpen = false;
-                                justLaunched = true;
-                            });
-                        }
-                    }
-                    else
-                    {
-                        justLaunched = false;
-                        if (isOpen && EventManager._Open && EventManager._Event.EventType == Title)
-                        {
-                            EventManager.CancelEvent("Daytime is upon us");
-                        }
-                    }
-                }                
-            }
-            timer.Once(30, () => CheckTime());
-        }
-        void StartEvent()
-        {
-            int time = 30;
-            timer.Repeat(1, 31, () =>
-            {
-                if (time == 30) EventManager.BroadcastToChat("Slasher will start in 30 seconds");
-                if (time == 10) EventManager.BroadcastToChat("Slasher will start in 10 seconds");
-                if (time == 0) EventManager.StartEvent();
-                time--;
-            });
-            return;
-        }
-        void NextRound()
-        {
-            EventManager.RespawnAllPlayers();
-            roundNumber++;
-            if (roundNumber >= configData.GameSettings.RoundsToPlay)
-            {
-                CheckScores(true);
-                return;
-            }
-            if (configData.GameSettings.AdjustTimeToSuitRounds)
-                TOD_Sky.Instance.Cycle.Hour = configData.GameSettings.Auto_StartTime + 1;
-            SetSlasherPlayers();
-            foreach (var player in SlasherPlayers)
-                EventManager.ResetPlayer(player.player);
-            StartRoundTimers(true);
-        }
-        void SetSlasherPlayers()
-        {
-            if (nextSlasher == null)
-                nextSlasher = GetRandomSlasher();
-            foreach (var player in SlasherPlayers)
-            {
-                if (player.player.userID == nextSlasher.userID)
-                    player.team = Team.SLASHER;
-                else player.team = Team.HUNTED;
-            }
-        }
-        
-        BasePlayer GetRandomSlasher()
-        {
-            var next = SlasherPlayers.GetRandom();
-            if (next == null || next.player == null)
-                return GetRandomSlasher();
-            return next.player;
-        }
-        void StartRoundTimers(bool initialRound)
-        {
-            if (gameEnding) return;
-            if (initialRound)
-            {
-                roundTimer = new GameObject().AddComponent<RoundTimer>();
-                roundTimer.StartTimer(configData.GameSettings.GameTimer_Slasher, configData.GameSettings.GameTimer_Player);
-                foreach (var player in SlasherPlayers)
-                {                    
-                    player.player.inventory.Strip();
-                    string msg;
-                    if (player.team == Team.SLASHER)
-                    {
-                        foreach (var item in configData.Slashers.Clothing)
-                            CreateItem(player.player, item.Key, 1, item.Value, "wear", null, null);
-
-                        var weapon = configData.Slashers.Weapon;
-                        CreateItem(player.player, weapon.Shortname, weapon.Amount, 0, "belt", weapon.AmmoType, weapon.Attachments);
-                        CreateItem(player.player, weapon.AmmoType, weapon.AmmoAmount, 0, "main", null, null);
-
-                        msg = "Kill the <color=#cc0000>Hunted</color>";
-                    }
-                    else
-                    {
-                        foreach (var item in configData.Players.Clothing)
-                            CreateItem(player.player, item.Key, 1, item.Value, "wear", null, null);
-
-                        var weapon = configData.Players.Weapon;
-                        CreateItem(player.player, weapon.Shortname, weapon.Amount, 0, "belt", weapon.AmmoType, weapon.Attachments);
-                        CreateItem(player.player, weapon.AmmoType, weapon.AmmoAmount, 0, "main", null, null);
-
-                        msg = "Hide from the <color=#cc0000>Slasher</color>";
-                    }
-                    PopupMessage(player.player, msg);
+                    InvokeHandler.Invoke(this, StartRound, Configuration.TimeBetweenRounds);
+                    BroadcastToPlayers(GetMessage, "Notification.RoundStartsIn", Configuration.TimeBetweenRounds);
                 }
             }
-            else
+
+            private void OnSlasherTimerExpired()
             {
-                foreach (var player in SlasherPlayers)
+                Timer.StartTimer(playerTime, GetMessage("Timer.Hunted", 0UL), EndRound);
+
+                StartCoroutine(GiveSlasherWeapons());
+
+                BroadcastToPlayers(GetMessage, "Notification.HuntersTurn");
+            }
+
+            private EventManager.BaseEventPlayer GetRandomSlasher()
+            {
+                EventManager.BaseEventPlayer nextSlasher = remainingSlashers.GetRandom();
+
+                remainingSlashers.Remove(nextSlasher);
+
+                if (remainingSlashers.Count == 0)
+                    remainingSlashers.AddRange(eventPlayers);
+
+                if (nextSlasher == null)
+                    return GetRandomSlasher();
+                return nextSlasher;
+            }
+
+            private IEnumerator ResetPlayers()
+            {
+                List<EventManager.BaseEventPlayer> currentPlayers = Facepunch.Pool.GetList<EventManager.BaseEventPlayer>();
+                currentPlayers.AddRange(eventPlayers);
+
+                for (int i = 0; i < currentPlayers.Count; i++)
                 {
-                    string msg;
-                    if (player.team == Team.SLASHER)
+                    EventManager.BaseEventPlayer eventPlayer = currentPlayers[i];
+                    if (eventPlayer != null)
                     {
-                        msg = "The hunter has become the <color=#cc0000>Hunted</color>";
-                    }
-                    else
-                    {                        
-                        var weapon = configData.Slashers.Weapon;
-                        CreateItem(player.player, weapon.Shortname, weapon.Amount, 0, "belt", weapon.AmmoType, weapon.Attachments);
-                        CreateItem(player.player, weapon.AmmoType, weapon.AmmoAmount, 0, "main", null, null);
-
-                        msg = "Hunt down the <color=#cc0000>Slasher</color>";
-                    }
-                    PopupMessage(player.player, msg);
-                }
-            }
-        }
-        void PopupMessage(BasePlayer player, string message)
-        {            
-            var Main = EventManager.UI.CreateElementContainer(SlasherPopup, "0 0 0 0", $"0.25 0.9", $"0.75 0.96", false, "Hud");
-            EventManager.UI.CreateLabel(ref Main, SlasherPopup, "", message, 17, "0 0", "1 1");
-            CuiHelper.AddUi(player, Main);
-            timer.Once(6, () => CuiHelper.DestroyUi(player, SlasherPopup));
-        }
-        void DestroyTimers()
-        {
-            if (roundTimer != null)            
-                UnityEngine.Object.Destroy(roundTimer);
-            foreach (var player in BasePlayer.activePlayerList)
-                CuiHelper.DestroyUi(player, SlasherClock);
-        }
-        void EndRound()
-        {
-            DestroyTimers();
-            EventManager.BroadcastEvent("Time has run out, the slasher wins this round!");
-            if (roundNumber >= configData.GameSettings.RoundsToPlay)
-                SendMessage("The next round starts in 10 seconds");
-            timer.Once(10, () => NextRound());
-        }
-        void CreateItem(BasePlayer player, string shortname, int amount, ulong skin, string container, string ammoType, string[] contents)
-        {
-            if (shortname == null) return;
-            var itemDef = ItemManager.FindItemDefinition(shortname);
-            if (itemDef == null)
-            {
-                PrintError($"Unable to find a item definition for {shortname}. Please check your config for valid entries");
-                return;
-            }
-            var item = ItemManager.Create(itemDef, amount, skin);
-            if (item == null)
-            {
-                PrintError($"Error creating item: {shortname}. Please check your config for valid entries");
-                return;
-            }
-            var weapon = item.GetHeldEntity() as BaseProjectile;
-            if (weapon != null)
-            {
-                if (!string.IsNullOrEmpty(ammoType))
-                {
-                    var type = ItemManager.FindItemDefinition(ammoType);
-                    if (ammoType != null)
-                    {
-                        weapon.primaryMagazine.ammoType = type;
-                        weapon.primaryMagazine.contents = weapon.primaryMagazine.capacity;
-                    }
-                }                
-            }
-            if (contents != null)
-                foreach (var content in contents)
-                    ItemManager.CreateByName(content)?.MoveToContainer(item.contents);
-
-            ItemContainer invContainer;
-            switch (container)
-            {
-                case "wear":
-                    invContainer = player.inventory.containerWear;
-                    break;
-                case "belt":
-                    invContainer = player.inventory.containerBelt;
-                    break;
-                default:
-                    invContainer = player.inventory.containerMain;
-                    break;
-            }
-            item.MoveToContainer(invContainer);
-        }
-        int GetRemainingCount()
-        {
-            int remaining = 0;
-            foreach (var user in SlasherPlayers)
-                if (user.team == Team.HUNTED)
-                    remaining++;
-            return remaining;
-        }
-        void SendMessage(string message)
-        {
-            if (configData.EventSettings.UseUINotifications)
-                EventManager.PopupMessage(message);
-            else PrintToChat(message);
-        }
-        #endregion
-
-        #region Scoring        
-        void AddKill(BasePlayer victim, BasePlayer attacker = null)
-        {
-            var vic = victim.GetComponent<SlasherPlayer>();
-            var att = attacker?.GetComponent<SlasherPlayer>();
-                        
-            if (vic.team == Team.SLASHER)
-            {
-                vic.team = Team.DEAD;
-
-                if (att != null)
-                    nextSlasher = att.player;
-                else nextSlasher = GetRandomSlasher();
-
-                foreach(var survivor in SlasherPlayers.Where(x => x.team == Team.HUNTED))
-                    EventManager.AddTokens(survivor.player.userID, configData.EventSettings.TokensOnSurvival);
-
-                SendMessage("The slasher has been killed!");
-                EndRound();
-            }
-            else
-            {
-                vic.team = Team.DEAD;
-
-                if (att != null)
-                {
-                    if (att.team == Team.SLASHER)
-                    {
-                        att.kills++;
-                        EventManager.AddTokens(att.player.userID, configData.EventSettings.TokensOnKill);
-
-                        if (GetRemainingCount() > 0)
+                        if (eventPlayer.IsDead)
                         {
-                            SendMessage(string.Format("{0} players remaining", GetRemainingCount()));                            
+                            EventManager.ResetPlayer(eventPlayer.Player);
+                            OnPlayerRespawn(eventPlayer);
                         }
                         else
                         {
-                            EventManager.AddTokens(att.player.userID, configData.EventSettings.TokensOnSurvival);
-                            SendMessage("All the players are dead. The slasher wins this round!");
-                            EndRound();
+                            EventManager.StripInventory(eventPlayer.Player);
+                            EventManager.ResetMetabolism(eventPlayer.Player);
+
+                            yield return CoroutineEx.waitForEndOfFrame;
+                            yield return CoroutineEx.waitForEndOfFrame;
+
+                            EventManager.GiveKit(eventPlayer.Player, eventPlayer.Kit);
+
+                            yield return CoroutineEx.waitForEndOfFrame;
+
+                            OnKitGiven(eventPlayer);
+                        }
+                    }
+                    
+                    yield return CoroutineEx.waitForEndOfFrame;
+                    yield return CoroutineEx.waitForEndOfFrame;
+                }
+
+                Facepunch.Pool.FreeList(ref currentPlayers);
+            }
+
+            private IEnumerator GiveSlasherWeapons()
+            {
+                for (int i = eventPlayers.Count - 1; i >= 0; i--)
+                {
+                    EventManager.BaseEventPlayer eventPlayer = eventPlayers[i];
+
+                    if (eventPlayer.IsDead || eventPlayer == slasherPlayer)
+                        continue;
+
+                    GiveSlasherWeapon(eventPlayer);
+
+                    yield return CoroutineEx.waitForEndOfFrame;
+                    yield return CoroutineEx.waitForEndOfFrame;
+                }
+            }
+            #endregion
+
+            protected override void GetWinningPlayers(ref List<EventManager.BaseEventPlayer> winners)
+            {
+                EventManager.BaseEventPlayer winner = null;
+
+                if (eventPlayers.Count > 0)
+                {
+                    int kills = 0;
+                    int deaths = 0;
+
+                    for (int i = 0; i < eventPlayers.Count; i++)
+                    {
+                        EventManager.BaseEventPlayer eventPlayer = eventPlayers[i];
+                        if (eventPlayer == null)
+                            continue;
+
+                        if (eventPlayer.Kills > kills)
+                        {
+                            winner = eventPlayer;
+                            kills = eventPlayer.Kills;
+                            deaths = eventPlayer.Deaths;
+                        }
+                        else if (eventPlayer.Kills == kills)
+                        {
+                            if (eventPlayer.Deaths < deaths)
+                            {
+                                winner = eventPlayer;
+                                kills = eventPlayer.Kills;
+                                deaths = eventPlayer.Deaths;
+                            }
                         }
                     }
                 }
-            }
-            UpdateScores();
-        }
-        void CheckScores(bool timelimit = false)
-        {
-            if (gameEnding) return;
-            if (SlasherPlayers.Count == 0)
-            {
-                EventManager.BroadcastToChat("There are no more players in the event");
-                EventManager.CloseEvent();
-                EventManager.EndEvent();
-                return;
-            }
-            if (SlasherPlayers.Count == 1)
-            {
-                Winner(SlasherPlayers[0].player);
-                return;
-            }
 
-            if (timelimit)
-            {
-                BasePlayer winner = null;
-                int score = 0;
-                foreach (var slPlayer in SlasherPlayers)
-                {
-                    if (slPlayer.kills > score)
-                    {
-                        winner = slPlayer.player;
-                    }
-                }
                 if (winner != null)
-                    Winner(winner);
-                return;
+                    winners.Add(winner);
             }
-        }
-        void Winner(BasePlayer player)
-        {
-            gameEnding = true;
-            if (player != null)
-            {
-                EventManager.AddTokens(player.userID, configData.EventSettings.TokensOnWin, true);
-                EventManager.BroadcastToChat(string.Format("{0} has won the event!", player.displayName));
-            }
-            EventManager.CloseEvent();
-            EventManager.EndEvent();
-        }
-        #endregion
 
-        #region Classes
-        class SlasherPlayer : MonoBehaviour
-        {
-            public BasePlayer player;
-            public int kills;
-            public Team team;
+            #region Scoreboards
+            protected override void BuildScoreboard()
+            {
+                scoreContainer = EMInterface.CreateScoreboardBase(this);
 
-            void Awake()
-            {
-                player = GetComponent<BasePlayer>();
-                enabled = false;
-                kills = 0;
-            }
-        }
-        class RoundTimer : MonoBehaviour
-        {
-            internal int slasherTime;
-            internal int playerTime;
-            internal bool initialRound;
+                int index = -1;
+                EMInterface.CreatePanelEntry(scoreContainer, string.Format(GetMessage("Score.RoundNumber", 0UL), currentRound, rounds), index += 1);
 
-            internal int timeRemaining;
-            void Awake() => timeRemaining = 0;
+                EMInterface.CreateScoreEntry(scoreContainer, string.Empty, "K", "D", index += 1);
 
-            public void StartTimer(int slasherTime, int playerTime)
-            {
-                this.slasherTime = slasherTime;
-                this.playerTime = playerTime;
-                timeRemaining = slasherTime;
-                initialRound = true;
-                InvokeRepeating("TimerTick", 1f, 1f);
-            }
-            void OnDestroy()
-            {
-                CancelInvoke("TimerTick");
-                Destroy(gameObject);
-            }
-            internal void TimerTick()
-            {
-                timeRemaining--;
-                
-                if (timeRemaining == 0)
+                for (int i = 0; i < Mathf.Min(scoreData.Count, 15); i++)
                 {
-                    CancelInvoke("TimerTick");
-                    if (initialRound)
-                    {
-                        initialRound = false;
-                        timeRemaining = playerTime;
-                        InvokeRepeating("TimerTick", 1f, 1f);
-                        instance.StartRoundTimers(false);
-                    } 
-                    else
-                    {
-                        instance.EndRound();
-                    }                   
-                }
-                else UpdateUITimer();
-            }
-            internal void UpdateUITimer()
-            {
-                string clockTime = "";
-                TimeSpan dateDifference = TimeSpan.FromSeconds(timeRemaining);
-                var hours = dateDifference.Hours;
-                var mins = dateDifference.Minutes;
-                var secs = dateDifference.Seconds;
-                if (hours > 0)
-                    clockTime = string.Format("{0:00}:{1:00}:{2:00}", hours, mins, secs);
-                else clockTime = string.Format("{0:00}:{1:00}", mins, secs);
-
-                var CUI = EventManager.UI.CreateElementContainer(SlasherClock, "0.1 0.1 0.1 0.7", "0.45 0.95", "0.55 0.99", false, "Hud.Under");
-                EventManager.UI.CreateLabel(ref CUI, SlasherClock, "", clockTime, 16, "0 0", "1 1");
-                foreach (var ePlayer in instance.SlasherPlayers)
-                {
-                    CuiHelper.DestroyUi(ePlayer.player, SlasherClock);
-                    CuiHelper.AddUi(ePlayer.player, CUI);
+                    EventManager.ScoreEntry score = scoreData[i];
+                    EMInterface.CreateScoreEntry(scoreContainer, score.displayName, ((int)score.value1).ToString(), ((int)score.value2).ToString(), i + index + 1);
                 }
             }
-            internal void DestroyUI()
+
+            protected override float GetFirstScoreValue(EventManager.BaseEventPlayer eventPlayer) => eventPlayer.Kills;
+
+            protected override float GetSecondScoreValue(EventManager.BaseEventPlayer eventPlayer) => eventPlayer.Deaths;
+
+            protected override void SortScores(ref List<EventManager.ScoreEntry> list)
             {
-                foreach (var player in BasePlayer.activePlayerList)
-                    CuiHelper.DestroyUi(player, SlasherClock);
+                list.Sort(delegate (EventManager.ScoreEntry a, EventManager.ScoreEntry b)
+                {
+                    int primaryScore = a.value1.CompareTo(b.value1);
+
+                    if (primaryScore == 0)
+                        return a.value2.CompareTo(b.value2) * -1;
+
+                    return primaryScore;
+                });
             }
+            #endregion
         }
-        class SlasherWeapon
+
+        private class SlasherPlayer : EventManager.BaseEventPlayer
         {
-            public string Shortname;
-            public int Amount;
-            public string AmmoType;
-            public int AmmoAmount;
-            public string[] Attachments;
-        }
-        enum Team
-        {
-            DEAD,
-            SLASHER,
-            HUNTED            
+            internal override void OnPlayerDeath(EventManager.BaseEventPlayer attacker = null, float respawnTime = 5)
+            {
+                AddPlayerDeath(attacker);
+
+                DestroyUI();
+
+                BeginSpectating();
+            }
         }
         #endregion
 
         #region Config        
-        private ConfigData configData;
-        class EventSettings
-        {
-            public string DefaultZoneID { get; set; }
-            public int TokensOnKill { get; set; }
-            public int TokensOnSurvival { get; set; }
-            public int TokensOnWin { get; set; }
-            public bool ShowScoreboard { get; set; }
-            public bool UseUINotifications { get; set; }
+        private static ConfigData Configuration;
+
+        private class ConfigData
+        {            
+            [JsonProperty(PropertyName = "Amount of time between rounds (seconds)")]
+            public int TimeBetweenRounds { get; set; }
+
+            public Oxide.Core.VersionNumber Version { get; set; }
         }
-        class GameSettings
+
+        protected override void LoadConfig()
         {
-            public float FFDamageModifier { get; set; }
-            public float StartHealth { get; set; }
-            public int RoundsToPlay { get; set; }
-            public bool AutoStart_Use { get; set; }
-            public float Auto_OpenTime { get; set; }
-            public float Auto_StartTime { get; set; }
-            public float Auto_EndTime { get; set; }
-            public int Auto_CancelTimer { get; set; }
-            public int GameTimer_Slasher { get; set; }
-            public int GameTimer_Player { get; set; }
-            public string DefaultSpawnfile { get; set; }
-            public bool AdjustTimeToSuitRounds { get; set; }
+            base.LoadConfig();
+            Configuration = Config.ReadObject<ConfigData>();
+
+            if (Configuration.Version < Version)
+                UpdateConfigValues();
+
+            Config.WriteObject(Configuration, true);
         }
-        class TeamSettings
+
+        protected override void LoadDefaultConfig() => Configuration = GetBaseConfig();
+
+        private ConfigData GetBaseConfig()
         {
-            public SlasherWeapon Weapon { get; set; }
-            public Dictionary<string, ulong> Clothing { get; set; }
-            public float DamageModifier { get; set; }            
-        }
-        class Messaging
-        {
-            public string MainColor { get; set; }
-            public string MSGColor { get; set; }
-        }        
-        class ConfigData
-        {
-            public EventSettings EventSettings { get; set; }
-            public GameSettings GameSettings { get; set; }
-            public TeamSettings Slashers { get; set; }
-            public TeamSettings Players { get; set; }
-            public Messaging Messaging { get; set; }
-            
-        }
-        private void LoadVariables()
-        {
-            LoadConfigVariables();
-            SaveConfig();
-            playerSpawns = configData.GameSettings.DefaultSpawnfile;
-        }
-        protected override void LoadDefaultConfig()
-        {
-            var config = new ConfigData
+            return new ConfigData
             {
-                EventSettings = new EventSettings
-                {
-                    DefaultZoneID = "slasherzone",
-                    TokensOnKill = 1,
-                    TokensOnSurvival = 1,
-                    TokensOnWin = 5,
-                    ShowScoreboard = true,
-                    UseUINotifications = true
-                },
-                GameSettings = new GameSettings
-                {
-                    AdjustTimeToSuitRounds = true,
-                    AutoStart_Use = true,
-                    Auto_CancelTimer = 6,
-                    Auto_OpenTime = 18f,
-                    Auto_EndTime = 6f,
-                    Auto_StartTime = 20f,
-                    FFDamageModifier = 0.4f,
-                    GameTimer_Player = 90,
-                    GameTimer_Slasher = 150,
-                    RoundsToPlay = 3,
-                    DefaultSpawnfile = "slasher_spawns",
-                    StartHealth = 100
-                },
-                Messaging = new Messaging
-                {
-                    MainColor = "<color=orange>",
-                    MSGColor = "<color=#939393>"
-                },
-                Players = new TeamSettings
-                {
-                    DamageModifier = 2.2f,
-                    Clothing = new Dictionary<string, ulong>
-                    {
-                        {"tshirt", 10039 },
-                        {"pants", 10078 },
-                        {"shoes.boots", 10044 }
-                    },              
-                    Weapon = new SlasherWeapon
-                    {
-                        AmmoAmount = 0,
-                        AmmoType = "",
-                        Amount = 2,
-                        Attachments = new string[0],
-                        Shortname = "torch"
-                    }
-                },
-                Slashers = new TeamSettings
-                {
-                    DamageModifier = 1.0f,
-                    Clothing = new Dictionary<string, ulong>
-                    {
-                        {"tshirt", 10038 },
-                        {"pants", 10078 },
-                        {"shoes.boots", 10044 },
-                        {"mask.bandana", 10064 }
-                    },                    
-                    Weapon = new SlasherWeapon
-                    {
-                        AmmoAmount = 40,
-                        AmmoType = "ammo.shotgun.slug",
-                        Amount = 1,
-                        Attachments = new string[] { "weapon.mod.flashlight" },
-                        Shortname = "shotgun.pump"
-                    }
-                }
+                TimeBetweenRounds = 10,
+                Version = Version
             };
-            SaveConfig(config);
         }
-        private void LoadConfigVariables() => configData = Config.ReadObject<ConfigData>();
-        void SaveConfig(ConfigData config) => Config.WriteObject(config, true);
-        #endregion        
+
+        protected override void SaveConfig() => Config.WriteObject(Configuration, true);
+
+        private void UpdateConfigValues()
+        {
+            PrintWarning("Config update detected! Updating config values...");
+
+            Configuration.Version = Version;
+            PrintWarning("Config update completed!");
+        }
+
+        #endregion
+
+        #region Localization
+        public string Message(string key, ulong playerId = 0U) => lang.GetMessage(key, this, playerId != 0U ? playerId.ToString() : null);
+
+        private static Func<string, ulong, string> GetMessage;
+
+        private readonly Dictionary<string, string> Messages = new Dictionary<string, string>
+        {
+            ["Score.Kills"] = "Kills: {0}",
+            ["Score.Deaths"] = "Deaths: {0}",
+            ["Score.Name"] = "Kills",
+            ["Score.Limit"] = "Score Limit : {0}",
+            ["Score.RoundNumber"] = "Round {0} / {1}",
+            ["Timer.Slasher"] = "Slasher Time",
+            ["Timer.Hunted"] = "Hunted Time",
+            ["Notification.RoundStartsIn"] = "The next round starts in <color=#007acc>{0}</color> seconds",
+            ["Notification.RoundStarted"] = "<color=#007acc>{0}</color> is the slasher. Hide from them!",
+            ["Notification.HuntersTurn"] = "The hunted have become the hunters!",
+            ["Notification.HuntedWin"] = "The hunted have won this round!",
+            ["Notification.SlasherWin"] = "The slasher has won this round!"
+        };
+        #endregion
     }
 }

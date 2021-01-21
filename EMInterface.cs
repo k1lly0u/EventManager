@@ -1,3459 +1,2110 @@
-﻿using Newtonsoft.Json.Linq;
+﻿//Requires: EventStatistics
 using System;
+using System.Text;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using Newtonsoft.Json;
 using Oxide.Core;
-using Oxide.Core.Configuration;
 using Oxide.Game.Rust.Cui;
 using Oxide.Core.Plugins;
 using UnityEngine;
 using System.Linq;
+using System.Globalization;
 
 namespace Oxide.Plugins
 {
-    [Info("Event Manager Menu Interface", "k1lly0u", "1.0.5", ResourceId = 2258)]
-    class EMInterface : RustPlugin
+    [Info("EMInterface", "k1lly0u", "2.0.0")]
+    [Description("Manages and provides user interface for event games")]
+    public class EMInterface : RustPlugin
     {
-        #region Fields
-        [PluginReference] EventManager EventManager;
-        [PluginReference] Plugin ZoneManager;
-        [PluginReference] Plugin Spawns;
-        [PluginReference] Plugin Kits;
-        [PluginReference] Plugin GunGame;
-        [PluginReference] Plugin LustyMap;
+        #region Fields    
+        [PluginReference] private Plugin ImageLibrary;
 
-        static EMInterface eminterface;
+        public static EMInterface Instance { get; private set; }
 
-        private EventVoting EventVotes = new EventVoting();
-
-        private Dictionary<string, string> ItemNames = new Dictionary<string, string>();
-        private Dictionary<string, string> ClassContents = new Dictionary<string, string>();
-        private Dictionary<ulong, Timer> PopupTimers = new Dictionary<ulong, Timer>();
-        private Dictionary<ulong, List<string>> UIEntries = new Dictionary<ulong, List<string>>();
-        private Dictionary<ulong, EventManager.Events> EventCreators = new Dictionary<ulong, EventManager.Events>();
-        private Dictionary<ulong, AEConfig> AutoCreators = new Dictionary<ulong, AEConfig>();
-
-        private string UIMain = "EMUI_Main";
-        private string UIAdmin = "EMUI_Admin";
-        private string UIPanel = "EMUI_Panel";
-        private string UIPopup = "EMUI_Popup";
-        private string UIEntry = "EMUI_Entry";
-
-        private Dictionary<string, string> UIColors = new Dictionary<string, string>();
-        private string Color1;
-        private string Color2;
-
-        public bool VotingOpen = false;
-        public Timer VoteTallyTimer;
-
-        private DynamicConfigFile E_Conf;
-        public EventConfig Event_Config;
+        public static ConfigData Configuration { get; set; }
         #endregion
 
-        #region Classes
-        public class EventConfig
+        #region Oxide Hooks        
+        protected override void LoadDefaultMessages()
         {
-            public Dictionary<string, EventManager.Events> Event_List = new Dictionary<string, EventManager.Events>();
-            public List<string> Classes = new List<string>();
-            public AutoEvents AutoEvent_Config = new AutoEvents();
-        }        
-        public class AutoEvents
-        {
-            public int GameInterval;
-            public bool AutoCancel;
-            public int AutoCancel_Timer;
-            public List<AEConfig> AutoEvent_List = new List<AEConfig>();
+            lang.RegisterMessages(Messages, this);
         }
-        public class AEConfig
-        {
-            public string EventConfig;            
-            public int TimeLimit = 15;
-            public int TimeToJoin = 120;
-            public int TimeToStart = 60;
-        }
-        public class EventVoting
-        {
-            private static Dictionary<int, int> EventVotes = new Dictionary<int, int>();
-            private static Dictionary<ulong, int> PlayerVotes = new Dictionary<ulong, int>();
-            private static List<ulong> OpenVotes = new List<ulong>();
-            private int requiredVotesToOpen = 0;
 
-            private static void ClearVotes()
+        private void OnServerInitialized()
+        {
+            Instance = this;
+
+            RegisterDeathScreenImages();
+        }
+
+        private void Unload()
+        {            
+            foreach (BasePlayer player in BasePlayer.activePlayerList)
+                DestroyAllUI(player);
+
+            Instance = null;
+            Configuration = null;
+        }
+        #endregion
+
+        #region UI Menus        
+        public enum MenuTab { Event, Statistics, Admin }
+        public enum AdminTab { None, OpenEvent, EditEvent, CreateEvent, DeleteEvent, KickPlayer, Selector }
+        public enum StatisticTab { Personal, Global, Leaders }
+        public enum SelectionType { Field, Event, Player }
+
+        private const float ELEMENT_HEIGHT = 0.035f;
+
+        public void OpenMenu(BasePlayer player, MenuArgs args)
+        {
+            CuiElementContainer container = UI.Container(UI_MENU, Configuration.Menu.Background.Get, new UI4(0.1f, 0.1f, 0.9f, 0.9f), true);
+
+            UI.Label(container, UI_MENU, Message("UI.Title", player.userID), 20, new UI4(0.005f, 0.94f, 0.995f, 1f), TextAnchor.MiddleLeft);
+
+            AddMenuButtons(player, container, UI_MENU, args.Menu);
+
+            switch (args.Menu)
             {
-                EventVotes.Clear();
-                PlayerVotes.Clear();
-                OpenVotes.Clear();
-            }           
-            public static void OpenEventVoting(bool enable)
+                case MenuTab.Event:
+                    CreateEventDetails(player, container, UI_MENU, args.Page);
+                    break;
+                case MenuTab.Admin:
+                    if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
+                        CreateAdminOptions(player, container, UI_MENU, args);
+                    break;
+                case MenuTab.Statistics:
+                    CreateStatisticsMenu(player, container, args);
+                    break;
+            }
+
+            CuiHelper.DestroyUi(player, UI_MENU);
+            CuiHelper.AddUi(player, container);
+        }
+
+        private void CreateMenuPopup(BasePlayer player, string text, float duration = 5f)
+        {
+            CuiElementContainer container = UI.Container(UI_POPUP, Configuration.Menu.Highlight.Get, new UI4(0.1f, 0.072f, 0.9f, 0.1f));
+            UI.Label(container, UI_POPUP, text, 12, UI4.Full);
+
+            CuiHelper.DestroyUi(player, UI_POPUP);
+            CuiHelper.AddUi(player, container);
+
+            player.Invoke(() => CuiHelper.DestroyUi(player, UI_POPUP), duration);
+        }
+
+        private void AddMenuButtons(BasePlayer player, CuiElementContainer container, string panel, MenuTab menuTab)
+        {
+            int i = 0;
+            float xMin = GetHorizontalPos(i);
+
+            UI.Button(container, panel, menuTab == MenuTab.Event ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Menu.Event", player.userID), 13, new UI4(xMin, 0.9f, xMin + 0.14f, 0.94f), menuTab == MenuTab.Event ? "" : $"emui.event 0 {(int)MenuTab.Event}");
+            xMin = GetHorizontalPos(i += 1) + (0.002f * i);
+
+            UI.Button(container, panel, menuTab == MenuTab.Statistics ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Menu.Statistics", player.userID), 13, new UI4(xMin, 0.9f, xMin + 0.14f, 0.94f), menuTab == MenuTab.Statistics ? "" : $"emui.statistics {(int)StatisticTab.Personal} {(int)EventStatistics.Statistic.Rank}");
+            xMin = GetHorizontalPos(i += 1) + (0.002f * i);
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                ClearVotes();
-                if (enable)
+                UI.Button(container, panel, menuTab == MenuTab.Admin ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Menu.Admin", player.userID), 13, new UI4(xMin, 0.9f, xMin + 0.14f, 0.94f), menuTab == MenuTab.Admin ? "" : $"emui.event 0 {(int)MenuTab.Admin}");
+                xMin = GetHorizontalPos(i += 1) + (0.002f * i);
+            }
+
+            UI.Button(container, panel, Configuration.Menu.Highlight.Get, "X", 16, new UI4(0.975f, 0.96f, 0.995f, 0.9925f), "emui.close");
+
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.005f, 0.897f, 0.995f, 0.9f));
+        }
+
+        #region Event Tab
+        private void CreateEventDetails(BasePlayer player, CuiElementContainer container, string panel, int page = 0)
+        {
+            UI.Panel(container, UI_MENU, Configuration.Menu.Panel.Get, new UI4(0.005f, 0.0075f, 0.499f, 0.836f));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Panel.Get, new UI4(0.501f, 0.0075f, 0.995f, 0.836f));
+
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.005f, 0.845f, 0.499f, 0.885f));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.501f, 0.845f, 0.995f, 0.885f));
+
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.005f, 0.841f, 0.499f, 0.844f));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.501f, 0.841f, 0.995f, 0.844f));
+
+            UI.Label(container, UI_MENU, Message("UI.Event.Current", player.userID), 13, new UI4(0.01f, 0.845f, 0.499f, 0.885f), TextAnchor.MiddleLeft);
+
+            if (EventManager.BaseManager != null) // Show current event details on the left and current scores on the right
+            {
+                #region Current Event Info
+                EventManager.BaseEventGame eventGame = EventManager.BaseManager;
+
+                int i = 0;
+                CreateListEntryLeft(container, Message("UI.Event.Name", player.userID), eventGame.Config.EventName, GetVerticalPos(i += 1, 0.841f));
+
+                CreateListEntryLeft(container, Message("UI.Event.Type", player.userID), eventGame.Config.EventType, GetVerticalPos(i += 1, 0.841f));
+                CreateListEntryLeft(container, Message("UI.Event.Status", player.userID), eventGame.Status.ToString(), GetVerticalPos(i += 1, 0.841f));
+
+                CreateListEntryLeft(container, Message("UI.Event.Players", player.userID),
+                    string.Format(Message("UI.Players.Format", player.userID), eventGame.eventPlayers.Count, eventGame.Config.MaximumPlayers, eventGame.joiningPlayers.Count),
+                    GetVerticalPos(i += 1, 0.841f));
+
+                if (eventGame.Config.TimeLimit > 0)
+                    CreateListEntryLeft(container, Message("UI.Event.TimeLimit", player.userID), $"{eventGame.Config.TimeLimit} seconds", GetVerticalPos(i += 1, 0.841f));
+
+                if (eventGame.Config.ScoreLimit > 0)
+                    CreateListEntryLeft(container, Message("UI.Event.ScoreLimit", player.userID), eventGame.Config.ScoreLimit.ToString(), GetVerticalPos(i += 1, 0.841f));
+
+                List<KeyValuePair<string, object>> additionalEventDetails = Facepunch.Pool.GetList<KeyValuePair<string, object>>();
+
+                eventGame.GetAdditionalEventDetails(ref additionalEventDetails, player.userID);
+
+                for (int y = 0; y < additionalEventDetails.Count; y++)
                 {
-                    int i = 0;
-                    foreach (var autocfg in eminterface.Event_Config.AutoEvent_Config.AutoEvent_List)
+                    KeyValuePair<string, object> kvp = additionalEventDetails[y];
+
+                    CreateListEntryLeft(container, kvp.Key, kvp.Value.ToString(), GetVerticalPos(i += 1, 0.841f));
+                }
+
+                Facepunch.Pool.FreeList(ref additionalEventDetails);
+
+                if (EventManager.Configuration.Reward.WinAmount > 0)
+                {
+                    CreateListEntryLeft(container, Message("UI.Event.WinReward", player.userID),
+                        string.Format(Message("UI.Reward.Format", player.userID), EventManager.Configuration.Reward.WinAmount, Message($"UI.Reward.{EventManager.Configuration.Reward.Type}", player.userID)),
+                        GetVerticalPos(i += 1, 0.841f));
+                }
+
+                if (EventManager.Configuration.Reward.KillAmount > 0)
+                {
+                    CreateListEntryLeft(container, Message("UI.Event.KillReward", player.userID),
+                        string.Format(Message("UI.Reward.Format", player.userID), EventManager.Configuration.Reward.KillAmount, Message($"UI.Reward.{EventManager.Configuration.Reward.Type}", player.userID)),
+                        GetVerticalPos(i += 1, 0.841f));
+                }
+
+                if (EventManager.Configuration.Reward.HeadshotAmount > 0)
+                {
+                    CreateListEntryLeft(container, Message("UI.Event.HeadshotReward", player.userID),
+                        string.Format(Message("UI.Reward.Format", player.userID), EventManager.Configuration.Reward.HeadshotAmount, Message($"UI.Reward.{EventManager.Configuration.Reward.Type}", player.userID)),
+                        GetVerticalPos(i += 1, 0.841f));
+                }
+
+                if (EventManager.GetUser(player) || eventGame.joiningPlayers.Contains(player))
+                {
+                    float yMin = GetVerticalPos(i += 1, 0.841f);
+                    UI.Button(container, UI_MENU, Configuration.Menu.Button.Get, Message("UI.Event.Leave", player.userID), 13, new UI4(0.3805f, yMin, 0.499f, yMin + ELEMENT_HEIGHT), "emui.leaveevent");
+                }
+                else
+                {
+                    if (eventGame.IsOpen())
                     {
-                        EventVotes.Add(i, 0);
-                        i++;
+                        float yMin = GetVerticalPos(i += 1, 0.841f);
+                        UI.Button(container, UI_MENU, Configuration.Menu.Button.Get, Message("UI.Event.Enter", player.userID), 13, new UI4(0.3805f, yMin, 0.499f, yMin + ELEMENT_HEIGHT), "emui.joinevent");
+                    }
+                }
+                #endregion
+
+                #region Current Event Scores
+                UI.Label(container, UI_MENU, Message("UI.Event.CurrentScores", player.userID), 13, new UI4(0.506f, 0.845f, 0.995f, 0.885f), TextAnchor.MiddleLeft);
+
+                if (eventGame.scoreData.Count > 0)
+                {
+                    int j = 0;
+                    const int ELEMENTS_PER_PAGE = 20;
+
+                    if (eventGame.scoreData.Count > (ELEMENTS_PER_PAGE * page) + ELEMENTS_PER_PAGE)
+                        UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "> > >", 10, new UI4(0.911f, 0.0075f, 0.995f, 0.0375f), $"emui.event {page + 1} {(int)MenuTab.Event}");
+                    if (page > 0)
+                        UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "< < <", 10, new UI4(0.005f, 0.0075f, 0.089f, 0.0375f), $"emui.event {page - 1} {(int)MenuTab.Event}");
+
+                    if (eventGame.Plugin.IsTeamEvent)
+                    {
+                        CreateScoreEntryRight(container, Message("UI.Event.TeamScore", player.userID),
+                            string.Format(Message("UI.Score.TeamA", player.userID), eventGame.GetTeamScore(EventManager.Team.A)),
+                            string.Format(Message("UI.Score.TeamB", player.userID), eventGame.GetTeamScore(EventManager.Team.B)), GetVerticalPos(j += 1, 0.841f));
                     }
 
-                    if (eminterface.EventManager._Launched && eminterface.configData.Voting.Auto_AllowEventVoting)
+                    for (int k = page * ELEMENTS_PER_PAGE; k < (page * ELEMENTS_PER_PAGE) + ELEMENTS_PER_PAGE; k++)
                     {
-                        eminterface.VotingOpen = true;
-                        eminterface.VoteTallyTimer = eminterface.timer.Once((eminterface.Event_Config.AutoEvent_Config.GameInterval * 60) - 30, () => eminterface.EventVotes.ProcessEventVotes());
+                        if (k >= eventGame.scoreData.Count)
+                            break;
+
+                        EventManager.ScoreEntry scoreEntry = eventGame.scoreData[k];
+
+                        string score1, score2;
+                        eventGame.Plugin.FormatScoreEntry(scoreEntry, player.userID, out score1, out score2);
+
+                        CreateScoreEntryRight(container, scoreEntry.displayName, score1, score2, GetVerticalPos(j += 1, 0.841f));
+                    }
+                }
+                else UI.Label(container, UI_MENU, Message("UI.Event.NoScoresRecorded", player.userID), 13, new UI4(0.506f, 0.806f, 0.88f, 0.841f), TextAnchor.MiddleLeft);
+                #endregion
+            }
+            else 
+            {
+                UI.Label(container, UI_MENU, Message("UI.Event.Previous", player.userID), 13, new UI4(0.506f, 0.845f, 0.995f, 0.885f), TextAnchor.MiddleLeft);
+
+                UI.Label(container, UI_MENU, Message("UI.Event.NoEvent", player.userID), 12, new UI4(0.01f, 0.801f, 0.495f, 0.845f), TextAnchor.MiddleLeft);
+
+                #region Last Event Scores
+                if (EventManager.LastEventResult?.IsValid ?? false)
+                {
+                    int ELEMENTS_PER_PAGE = EventManager.LastEventResult.Plugin.IsTeamEvent ? 17 : 18;
+
+                    if (EventManager.LastEventResult.Scores.Count > (ELEMENTS_PER_PAGE * page) + ELEMENTS_PER_PAGE)
+                        UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "> > >", 10, new UI4(0.911f, 0.0075f, 0.995f, 0.0375f), $"emui.event {page + 1} {(int)MenuTab.Event}");
+                    if (page > 0)
+                        UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "< < <", 10, new UI4(0.005f, 0.0075f, 0.089f, 0.0375f), $"emui.event {page - 1} {(int)MenuTab.Event}");
+
+                    int i = 0;
+
+                    CreateSplitEntryRight(container, Message("UI.Event.Name", player.userID), EventManager.LastEventResult.EventName, GetVerticalPos(i += 1, 0.841f));
+                    CreateSplitEntryRight(container, Message("UI.Event.Type", player.userID), EventManager.LastEventResult.EventType, GetVerticalPos(i += 1, 0.841f));
+
+                    if (EventManager.LastEventResult.Plugin.IsTeamEvent)
+                    {                        
+                        CreateScoreEntryRight(container, Message("UI.Event.TeamScore", player.userID), 
+                            string.Format(Message("UI.Score.TeamA", player.userID), EventManager.LastEventResult.TeamScore.value1), 
+                            string.Format(Message("UI.Score.TeamB", player.userID), EventManager.LastEventResult.TeamScore.value2), GetVerticalPos(i += 1, 0.841f));
+                    }
+
+                    for (int k = page * ELEMENTS_PER_PAGE; k < (page * ELEMENTS_PER_PAGE) + ELEMENTS_PER_PAGE; k++)
+                    {
+                        if (k >= EventManager.LastEventResult.Scores.Count)
+                            break;
+
+                        EventManager.ScoreEntry scoreEntry = EventManager.LastEventResult.Scores[k];
+
+                        string score1, score2;
+                        EventManager.LastEventResult.Plugin.FormatScoreEntry(scoreEntry, player.userID, out score1, out score2);
+
+                        CreateScoreEntryRight(container, scoreEntry.displayName, score1, score2, GetVerticalPos(i += 1, 0.841f));
                     }
                 }
                 else
                 {
-                    eminterface.VotingOpen = false;
+                    UI.Label(container, UI_MENU, Message("UI.Event.NoPrevious", player.userID), 12, new UI4(0.506f, 0.801f, 0.995f, 0.845f), TextAnchor.MiddleLeft);
                 }
+                #endregion
             }
-            public void ProcessEventVotes()
+        }
+
+        #region Helpers
+        private void CreateListEntryLeft(CuiElementContainer container, string key, string value, float yMin)
+        {
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.005f, yMin, 0.38f, yMin + ELEMENT_HEIGHT));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.3805f, yMin, 0.499f, yMin + ELEMENT_HEIGHT));
+            UI.Label(container, UI_MENU, key, 12, new UI4(0.01f, yMin, 0.38f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+            UI.Label(container, UI_MENU, value, 12, new UI4(0.3805f, yMin, 0.494f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleRight);
+        }
+
+        private void CreateListEntryRight(CuiElementContainer container, string key, string value, float yMin)
+        {
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.501f, yMin, 0.88f, yMin + ELEMENT_HEIGHT));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.8805f, yMin, 0.995f, yMin + ELEMENT_HEIGHT));
+            UI.Label(container, UI_MENU, key, 12, new UI4(0.506f, yMin, 0.88f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+            UI.Label(container, UI_MENU, value, 12, new UI4(0.8805f, yMin, 0.99f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleRight);
+        }
+
+        private void CreateScoreEntryRight(CuiElementContainer container, string displayName, string score1, string score2, float yMin)
+        {
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.501f, yMin, 0.748f, yMin + ELEMENT_HEIGHT));
+            UI.Label(container, UI_MENU, displayName, 12, new UI4(0.506f, yMin, 0.748f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+
+            if (!string.IsNullOrEmpty(score1))
             {
-                eminterface.VotingOpen = false;
-                int eventIndex = -1;
-                int voteCount = 0;
-                foreach (var vote in EventVotes)
-                {
-                    if (vote.Value > voteCount)
-                    {
-                        eventIndex = vote.Key;
-                        voteCount = vote.Value;
-                    }
-                }
-                if (eventIndex != -1)
-                {
-                    if (!eminterface.EventManager._Launched)
-                    {
-                        eminterface.EventManager._Event = eminterface.Event_Config.Event_List[eminterface.EventManager.ValidAutoEvents[eventIndex].EventConfig];
-                        eminterface.EventManager.OpenEvent();
-                    }
-                    else
-                    {
-                        eminterface.EventManager._AutoEventNum = eventIndex;
-                        eminterface.EventManager._NextConfigName = eminterface.EventManager.ValidAutoEvents[eventIndex].EventConfig;
-                        eminterface.EventManager._ForceNextConfig = true;
-                        eminterface.EventManager.BroadcastToChat(string.Format("Event votes have been tallied. The next event will be: {0}", eminterface.Event_Config.Event_List.ToList()[eventIndex].Key));
-                    }
-                }
-                ClearVotes();
+                UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.7485f, yMin, 0.8725f, yMin + ELEMENT_HEIGHT));
+                UI.Label(container, UI_MENU, score1, 12, new UI4(0.7535f, yMin, 0.8675f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleRight);
             }
-            public void VoteOpenEvent(ulong playerid)
+            else UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.7485f, yMin, 0.8725f, yMin + ELEMENT_HEIGHT));
+
+            if (!string.IsNullOrEmpty(score2))
             {
-                if (!OpenVotes.Contains(playerid))
-                    OpenVotes.Add(playerid);
-                if (OpenVotes.Count >= requiredVotesToOpen)
-                {
-                    eminterface.VotingOpen = true;
-                    eminterface.StartEventVoteTimer();
-                    OpenVotes.Clear();
-                }
+                UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.875f, yMin, 0.995f, yMin + ELEMENT_HEIGHT));
+                UI.Label(container, UI_MENU, score2, 12, new UI4(0.88f, yMin, 0.99f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleRight);
             }
-            public void AddPlayerVote(ulong playerid, int index)
-            {
-                if (!PlayerVotes.ContainsKey(playerid))
-                {
-                    PlayerVotes.Add(playerid, index);
-                    EventVotes[index]++;
-                }
-            }
-            public void RemovePlayerVote(ulong playerid)
-            {
-                if (PlayerVotes.ContainsKey(playerid))
-                {
-                    EventVotes[PlayerVotes[playerid]]--;
-                    PlayerVotes.Remove(playerid);
-                }
-            }
-            public void SetVotesToOpen(int amount) => requiredVotesToOpen = amount;
-            public object GetVotedEvent(ulong playerid)
-            {
-                int voted = -1;
-                if (!PlayerVotes.TryGetValue(playerid, out voted))
-                    return null;
-                return voted;                
-            }
-            public int GetVoteCount(int index) => EventVotes[index];
-            public int GetVoteOpenCount() => OpenVotes.Count;
-            public int GetRequiredCount() => requiredVotesToOpen;
-            public bool HasVotedOpen(ulong playerid) => OpenVotes.Contains(playerid);
+            else UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.875f, yMin, 0.995f, yMin + ELEMENT_HEIGHT));
+        }
+
+        private void CreateSplitEntryRight(CuiElementContainer container, string key, string value, float yMin)
+        {
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.501f, yMin, 0.748f, yMin + ELEMENT_HEIGHT));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.7485f, yMin, 0.995f, yMin + ELEMENT_HEIGHT));
+            UI.Label(container, UI_MENU, key, 12, new UI4(0.506f, yMin, 0.748f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+            UI.Label(container, UI_MENU, value, 12, new UI4(0.7485f, yMin, 0.99f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleRight);
         }
         #endregion
-
-        #region Oxide Hooks
-        void Loaded()
-        {
-            E_Conf = Interface.Oxide.DataFileSystem.GetFile("EventManager/EventsConfig");
-            permission.RegisterPermission("eminterface.admin", this);
-            lang.RegisterMessages(Messages, this);
-        }
-        void OnServerInitialized()
-        {
-            LoadVariables();
-            LoadData();
-            eminterface = this;
-            SetUIColors();
-            CollectItemDetails();
-            CollectClassList();
-            GetRequiredVoteLoop();
-            timer.In(15, () =>
-            {
-                if (EventManager)
-                    EventVoting.OpenEventVoting(true);
-            });
-        }
-        void Unload()
-        {
-            foreach (var player in BasePlayer.activePlayerList)
-                DestroyAllUI(player);
-        }
         #endregion
 
-        #region Other
-        string msg(string key, BasePlayer player = null) => lang.GetMessage(key, this, player?.UserIDString);
-
-        [ChatCommand("event")]
-        private void cmdEventMenu(BasePlayer player, string command, string[] args)
+        #region Admin Tab
+        private void CreateAdminOptions(BasePlayer player, CuiElementContainer container, string panel, MenuArgs args)
         {
-            if (args != null && args.Length == 1)
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.005f, 0.845f, 0.175f, 0.885f));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.005f, 0.841f, 0.175f, 0.844f));
+
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.177f, 0.845f, 0.995f, 0.885f));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.177f, 0.841f, 0.995f, 0.844f));
+
+            UI.Label(container, UI_MENU, Message("UI.Admin.Title", player.userID), 13, new UI4(0.01f, 0.845f, 0.175f, 0.885f), TextAnchor.MiddleLeft);
+
+            UI.Panel(container, UI_MENU, Configuration.Menu.Panel.Get, new UI4(0.005f, 0.0075f, 0.175f, 0.836f));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Panel.Get, new UI4(0.177f, 0.0075f, 0.995f, 0.836f));
+
+            int i = 1;
+            float yMin = GetVerticalPos(i, 0.836f);
+
+            if (EventManager.BaseManager != null)
             {
-                switch (args[0].ToLower())
+                if ((int)EventManager.BaseManager.Status < 2)
                 {
-                    case "join":
-                        {
-                            var success = EventManager.JoinEvent(player);
-                            if (success is string)
-                                SendReply(player, (string)success);
-                        }
-                        return;
-                    case "leave":
-                        {
-                            var success = EventManager.LeaveEvent(player);
-                            if (success is string)
-                                SendReply(player, (string)success);
-                        }
-                        return;
-                    case "start":
-                        if (HasPerm(player))
-                        {
-                            var success = EventManager.StartEvent();
-                            if (success is string)
-                                SendReply(player, (string)success);
-                        }
-                        return;
-                    case "end":
-                        if (HasPerm(player))
-                        {
-                            var success = EventManager.EndEvent();
-                            if (success is string)
-                                SendReply(player, (string)success);
-                            SendReply(player, msg("endingEvent", player));
-                        }
-                        return;
-                    default:
-                        break;
+                    UI.Button(container, UI_MENU, Configuration.Menu.Button.Get, Message("UI.Admin.Start", player.userID), 12, new UI4(0.01f, yMin, 0.17f, yMin + ELEMENT_HEIGHT), "emui.startevent");
+                    yMin = GetVerticalPos(i += 1, 0.836f);
                 }
-            }
-            OpenMenu(player);
-        }
-        #endregion
 
-        #region UI
-        private void OpenMenu(BasePlayer player)
-        {
-            CloseMap(player);
-            CreateMenuMain(player);
-            CreateHome(player);
-        }
-        public void CreateMenuMain(BasePlayer player)
-        {
-            var Main = EventManager.UI.CreateElementContainer(UIMain, UIColors["dark"], "0 0.92", "1 1", true);
-            EventManager.UI.CreatePanel(ref Main, UIMain, UIColors["light"], "0.01 0.03", "0.99 0.97", true);
-            EventManager.UI.CreateLabel(ref Main, UIMain, "", $"{Color1}{msg("Event Manager", player)}  v{EventManager.Version}</color>", 30, "0.05 0", "0.2 1");
-            int i = 0;
-            CreateMenuButton(ref Main, UIMain, msg("Home", player), "EMI_ChangeElement home", i); i++;
-            if (configData.Voting.Auto_AllowEventVoting || configData.Voting.Standard_AllowVoteToOpen) { CreateMenuButton(ref Main, UIMain, msg("Voting", player), "EMI_ChangeElement voting", i); i++; }
-            CreateMenuButton(ref Main, UIMain, msg("Statistics", player), "EMI_ChangeElement stats", i); i++;
-            if (EventManager._Started && EventManager.isPlaying(player) && EventManager._Event.UseClassSelector) { CreateMenuButton(ref Main, UIMain, msg("Change Class", player), "EMI_ChangeElement selectclass", i); i++; }
-            if (HasPerm(player)) { CreateMenuButton(ref Main, UIMain, msg("Admin", player), "EMI_ChangeElement admin", i); i++; }
-            CreateMenuButton(ref Main, UIMain, msg("Close", player), "EMI_DestroyAll", i);
-
-            CuiHelper.DestroyUi(player, UIMain);
-            CuiHelper.AddUi(player, Main);
-        }        
-        private void CreateHome(BasePlayer player)
-        {            
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "1 0.92", false);
-           
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.01 0.01", "0.495 0.55");            
-            if (EventManager.GameStatistics.Stats.ContainsKey(player.userID))
-            {
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Your Statistics", player), 20, "0.1 0.48", "0.4 0.54");
-                var Stats = EventManager.StatsCache[player.userID];
-                AddInfoEntry(ref MainCont, UIPanel, msg("Rank", player), Stats.Rank.ToString(), 0, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("K/D Ratio", player), GetRatio(Stats.Kills, Stats.Deaths), 1, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("Games Played", player), Stats.GamesPlayed.ToString(), 2, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("Games Won", player), Stats.GamesWon.ToString(), 3, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("Games Lost", player), Stats.GamesLost.ToString(), 4, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("Kills", player), Stats.Kills.ToString(), 5, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("Deaths", player), Stats.Deaths.ToString(), 6, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("Shots Fired", player), Stats.ShotsFired.ToString(), 7, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("Helicopters Killed", player), Stats.ChoppersKilled.ToString(), 8, 0.42f, 0.47f, 0.04f);
-                AddInfoEntry(ref MainCont, UIPanel, msg("Flags Captured", player), Stats.FlagsCaptured.ToString(), 9, 0.42f, 0.47f, 0.04f);
-            }
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("You do not have any saved data", player), 16, "0.1 0.2", "0.4 0.8");
-            
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.01 0.56", "0.495 0.99");
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Event Status:", player), 18, "0.05 0.87", "0.25 0.93", TextAnchor.MiddleLeft);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", GetEventStatus(), 18, "0.25 0.87", "0.5 0.93", TextAnchor.MiddleLeft);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Autoevent Status:", player), 18, "0.05 0.81", "0.25 0.87", TextAnchor.MiddleLeft);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", GetAutoEventStatus(), 18, "0.25 0.81", "0.5 0.87", TextAnchor.MiddleLeft);
-            
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.5 0.01", "0.99 0.99");
-            if (EventManager._Open || EventManager._Started)
-            {                
-                GetEventInfo(ref MainCont, UIPanel);
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Current Game Scores", player), 18, "0.55 0.87", "0.95 0.93");
-                GetGameScores(ref MainCont, UIPanel, 0.6f, 0.82f);
-                if (EventManager._Open)
+                if (EventManager.BaseManager.IsOpen())
                 {
-                    if (EventManager.isPlaying(player))
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Leave Event", player), 18, "0.38 0.87", "0.48 0.92", "EMI_LeaveEvent");
-                    else if (EventManager._Open) EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Join Event", player), 18, "0.38 0.87", "0.48 0.92", "EMI_JoinEvent");
+                    UI.Button(container, UI_MENU, Configuration.Menu.Button.Get, Message("UI.Admin.Close", player.userID), 12, new UI4(0.01f, yMin, 0.17f, yMin + ELEMENT_HEIGHT), "emui.closeevent");
+                    yMin = GetVerticalPos(i += 1, 0.836f);
                 }
-            }
-            else if (!EventManager._Open && !EventManager._Started)
-            {
-                if (EventManager.GameScores.Scores != null && EventManager.GameScores.Scores.Count > 0)
-                {
-                    EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Previous Game Scores", player), 18, "0.55 0.87", "0.95 0.93", TextAnchor.UpperCenter);
-                    GetGameScores(ref MainCont, UIPanel, 0.6f, 0.82f);
-                }
-            }
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
 
-        private void CreateVoting(BasePlayer player, int page = 0)
-        {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "1 0.92", false);
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.01 0.01", "0.99 0.99", true);
-            if (((configData.Voting.Standard_AllowVoteToOpen && !EventManager._Launched) || (configData.Voting.Auto_AllowEventVoting && EventManager._Launched)) && VotingOpen && !EventManager._Open && !EventManager._Started)
-            {
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"Vote for the next event to play!", 18, "0.2 0.92", "0.8 0.98");
-                if (Event_Config.AutoEvent_Config.AutoEvent_List.Count > 9)
-                {
-                    var maxpages = (Event_Config.AutoEvent_Config.AutoEvent_List.Count - 1) / 9 + 1;
-                    if (page < maxpages - 1)
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], "Next", 18, "0.84 0.925", "0.97 0.98", $"EMI_ChangePage vote {page + 1}");
-                    if (page > 0)
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], "Back", 18, "0.03 0.925", "0.16 0.98", $"EMI_ChangePage vote {page - 1}");
-                }
-                int maxentries = (9 * (page + 1));
-                if (maxentries > Event_Config.AutoEvent_Config.AutoEvent_List.Count)
-                    maxentries = Event_Config.AutoEvent_Config.AutoEvent_List.Count;
-                int eventcount = 9 * page;
+                UI.Button(container, UI_MENU, Configuration.Menu.Button.Get, Message("UI.Admin.End", player.userID), 12, new UI4(0.01f, yMin, 0.17f, yMin + ELEMENT_HEIGHT), "emui.endevent");
+                yMin = GetVerticalPos(i += 1, 0.836f);
 
-                if (Event_Config.AutoEvent_Config.AutoEvent_List.Count == 0)
-                    EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"There are no saved auto-events", 18, "0.2 0.92", "0.8 0.98");
-
-                CuiHelper.DestroyUi(player, UIPanel);
-                CuiHelper.AddUi(player, MainCont);
-
-
-                int votedEvent = -1;
-                var hasVoted = EventVotes.GetVotedEvent(player.userID);
-                if (hasVoted != null)
-                    votedEvent = (int)hasVoted;
-
-                int i = 0;
-                for (int n = eventcount; n < maxentries; n++)
-                {
-                    var voteCount = EventVotes.GetVoteCount(n);
-                    if (n == votedEvent)
-                        CreateEventEntry(player, $"Event {n}", Event_Config.Event_List[Event_Config.AutoEvent_Config.AutoEvent_List[n].EventConfig], $"EMI_EventVote unvote", $"{Color1}Unvote</color>", i, 0.32f);
-                    else if (votedEvent > -1) CreateEventEntry(player, $"Event {n}", Event_Config.Event_List[Event_Config.AutoEvent_Config.AutoEvent_List[n].EventConfig], $"", $"", i, 0.32f);
-                    else CreateEventEntry(player, $"Event {n}", Event_Config.Event_List[Event_Config.AutoEvent_Config.AutoEvent_List[n].EventConfig], $"EMI_EventVote vote {n}", $"{Color1}Vote</color>   ({voteCount})", i, 0.32f);
-                    i++;
-                }
-            }
-            else if (!configData.Voting.Standard_AllowVoteToOpen)
-            {
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Voting requires auto events to be launched", player), 18, "0.2 0.92", "0.8 0.98");
-                CuiHelper.DestroyUi(player, UIPanel);
-                CuiHelper.AddUi(player, MainCont);
-            }
-            else if (configData.Voting.Standard_AllowVoteToOpen && !VotingOpen && !EventManager._Launched && !EventManager._Open && !EventManager._Started)
-            {
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Vote to open a new event", player), 18, "0.2 0.92", "0.8 0.98");
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", string.Format(msg("Total Votes : {0}{1}</color>", player), Color1, EventVotes.GetVoteOpenCount()), 18, "0.2 0.75", "0.8 0.8");
-
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", string.Format(msg("Required Votes : {0}{1}</color>", player), Color1, EventVotes.GetRequiredCount()), 18, "0.2 0.7", "0.8 0.75");
-
-                if (EventVotes.HasVotedOpen(player.userID))
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Voted", player), 18, "0.45 0.4", "0.55 0.45", "");
-                else EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Vote", player), 18, "0.45 0.4", "0.55 0.45", "EMI_EventVote open");
-
-                CuiHelper.DestroyUi(player, UIPanel);
-                CuiHelper.AddUi(player, MainCont);
+                //UI.Button(container, UI_MENU, args.Admin == AdminTab.KickPlayer ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Admin.Kick", player.userID), 12, new UI4(0.01f, yMin, 0.17f, yMin + ELEMENT_HEIGHT), "emui.kickplayer");
+                //yMin = GetVerticalPos(i += 1, 0.836f);
             }
             else
             {
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", "Voting is currently disabled", 18, "0.2 0.92", "0.8 0.98");
-                CuiHelper.DestroyUi(player, UIPanel);
-                CuiHelper.AddUi(player, MainCont);
+                UI.Button(container, UI_MENU, args.Admin == AdminTab.OpenEvent ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Admin.Open", player.userID), 12, new UI4(0.01f, yMin, 0.17f, yMin + ELEMENT_HEIGHT), $"emui.eventselector {(int)AdminTab.OpenEvent}");
+                yMin = GetVerticalPos(i += 1, 0.836f);
+
+                UI.Button(container, UI_MENU, args.Admin == AdminTab.EditEvent ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Admin.Edit", player.userID), 12, new UI4(0.01f, yMin, 0.17f, yMin + ELEMENT_HEIGHT), $"emui.eventselector {(int)AdminTab.EditEvent}");
+                yMin = GetVerticalPos(i += 1, 0.836f);
+
+                UI.Button(container, UI_MENU, args.Admin == AdminTab.CreateEvent ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Admin.Create", player.userID), 12, new UI4(0.01f, yMin, 0.17f, yMin + ELEMENT_HEIGHT), "emui.create");
+                yMin = GetVerticalPos(i += 1, 0.836f);
+
+                UI.Button(container, UI_MENU, args.Admin == AdminTab.DeleteEvent ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Admin.Delete", player.userID), 12, new UI4(0.01f, yMin, 0.17f, yMin + ELEMENT_HEIGHT), $"emui.eventselector {(int)AdminTab.DeleteEvent}");
+                yMin = GetVerticalPos(i += 1, 0.836f);
+            }
+
+            switch (args.Admin)
+            {                
+                case AdminTab.OpenEvent:
+                case AdminTab.EditEvent:
+                case AdminTab.DeleteEvent:
+                    OpenEventSelector(player, container, UI_MENU, args.Selector, args.Page);                   
+                    break;
+                case AdminTab.CreateEvent:
+                    EventCreatorMenu(player, container, UI_MENU);
+                    break;                
+                case AdminTab.KickPlayer:
+                    break;
+                case AdminTab.Selector:
+                    OpenSelector(player, container, UI_MENU, args.Selector, args.Page);
+                    break;
+                default:
+                    break;
             }
         }
-        private void CreateStatistics(BasePlayer player)
-        {            
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "1 0.92", true);            
+        #endregion
 
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.01 0.01", "0.495 0.99");
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Global Statistics", player), 20, "0.1 0.92", "0.4 0.98");
+        #region Event Creation
+        private Hash<ulong, EventManager.EventConfig> _eventCreators = new Hash<ulong, EventManager.EventConfig>();
+
+        private void EventCreatorMenu(BasePlayer player, CuiElementContainer container, string panel)
+        {
+            EventManager.EventConfig eventConfig;
+            _eventCreators.TryGetValue(player.userID, out eventConfig);
+
             int i = 0;
-            AddInfoEntry(ref MainCont, UIPanel, msg("Total Games Played", player), EventManager.GameStatistics.GetTotalGamesPlayed(), i, 0.85f, 0.9f, 0.05f); i++;
-            AddInfoEntry(ref MainCont, UIPanel, msg("Total Player Kills", player), EventManager.GameStatistics.GetTotalKills(), i, 0.85f, 0.9f, 0.05f); i++;
-            AddInfoEntry(ref MainCont, UIPanel, msg("Total Player Deaths", player), EventManager.GameStatistics.GetTotalDeaths(), i, 0.85f, 0.9f, 0.05f); i++;
-            AddInfoEntry(ref MainCont, UIPanel, msg("Total Event Players", player), EventManager.GameStatistics.GetTotalPlayers(), i, 0.85f, 0.9f, 0.05f); i++;
-            AddInfoEntry(ref MainCont, UIPanel, msg("Total Shots Fired", player), EventManager.GameStatistics.GetTotalShotsFired(), i, 0.85f, 0.9f, 0.05f); i++;
-            if (EventManager.EventGames.ContainsKey("CaptureTheFlag"))
-            {
-                AddInfoEntry(ref MainCont, UIPanel, msg("Total Flags Captured", player), EventManager.GameStatistics.GetFlagsCaptured(), i, 0.85f, 0.9f, 0.05f); i++;
-            }
-            if (EventManager.EventGames.ContainsKey("ChopperSurvival"))
-            {
-                AddInfoEntry(ref MainCont, UIPanel, msg("Total Helicopters Killed", player), EventManager.GameStatistics.GetChoppersKilled(), i, 0.85f, 0.9f, 0.05f); i++;
-            }
 
-            i++;
-            foreach (var entry in EventManager.GameStatistics.GamesPlayed.OrderByDescending(x => x.Value))
+            if (eventConfig == null || string.IsNullOrEmpty(eventConfig.EventType))
             {
-                AddInfoEntry(ref MainCont, UIPanel, entry.Key, entry.Value.ToString(), i, 0.85f, 0.9f, 0.05f);
+                UI.Label(container, UI_MENU, "Select an event type", 13, new UI4(0.182f, 0.845f, 0.99f, 0.885f), TextAnchor.MiddleLeft);
+
+                foreach (string eventName in EventManager.Instance.EventModes.Keys)
+                {
+                    float yMin = GetVerticalPos(i += 1, 0.836f);
+                    UI.Button(container, panel, Configuration.Menu.Button.Get, eventName, 12, new UI4(0.182f, yMin, 0.3f, yMin + ELEMENT_HEIGHT), $"emui.create {CommandSafe(eventName)}");
+                }
+            }
+            else
+            {
+                UI.Label(container, UI_MENU, $"Creating Event ({eventConfig.EventType})", 13, new UI4(0.182f, 0.845f, 0.99f, 0.885f), TextAnchor.MiddleLeft);
+
+                UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "Save", 12, new UI4(0.925f, 0.845f, 0.995f, 0.885f), "emui.saveevent");
+                UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "Dispose", 12, new UI4(0.85f, 0.845f, 0.92f, 0.885f), "emui.disposeevent");
+
+                AddInputField(container, panel, i += 1, "Event Name", "eventName", eventConfig.EventName);
+
+                AddSelectorField(container, panel, i += 1, "Zone ID", "zoneID", eventConfig.ZoneID, "GetZoneIDs");
+
+                if (eventConfig.Plugin.IsTeamEvent)
+                {
+                    AddSelectorField(container, panel, i += 1, "Team A Spawnfile", "teamASpawnfile", eventConfig.TeamConfigA.Spawnfile, "GetSpawnfileNames");
+
+                    AddSelectorField(container, panel, i += 1, "Team A Kit(s)", "teamAKits", GetSelectorLabel(eventConfig.TeamConfigA.Kits), "GetAllKits", eventConfig.AllowClassSelection);
+
+                    AddInputField(container, panel, i += 1, "Team A Color (Hex)", "teamAColor", eventConfig.TeamConfigA.Color);
+
+                    AddSelectorField(container, panel, i += 1, "Team A Clothing", "teamAClothing", eventConfig.TeamConfigA.Clothing, "GetAllKits", false);
+
+                    AddSelectorField(container, panel, i += 1, "Team B Spawnfile", "teamBSpawnfile", eventConfig.TeamConfigB.Spawnfile, "GetSpawnfileNames");
+
+                    AddSelectorField(container, panel, i += 1, "Team B Kit(s)", "teamBKits", GetSelectorLabel(eventConfig.TeamConfigB.Kits), "GetAllKits", eventConfig.AllowClassSelection);
+
+                    AddInputField(container, panel, i += 1, "Team B Color (Hex)", "teamBColor", eventConfig.TeamConfigB.Color);
+
+                    AddSelectorField(container, panel, i += 1, "Team B Clothing", "teamBClothing", eventConfig.TeamConfigB.Clothing, "GetAllKits", false);
+                }
+                else
+                {
+                    AddSelectorField(container, panel, i += 1, "Spawnfile", "teamASpawnfile", eventConfig.TeamConfigA.Spawnfile, "GetSpawnfileNames");
+
+                    AddSelectorField(container, panel, i += 1, "Kit(s)", "teamAKits", GetSelectorLabel(eventConfig.TeamConfigA.Kits), "GetAllKits", eventConfig.AllowClassSelection);
+                }
+
+                if (eventConfig.Plugin.CanUseClassSelector)
+                    AddToggleField(container, panel, i += 1, "Use Class Selector", "useClassSelector", eventConfig.AllowClassSelection);
+
+                if (eventConfig.Plugin.UseTimeLimit)
+                    AddInputField(container, panel, i += 1, "Time Limit (seconds)", "timeLimit", eventConfig.TimeLimit);
+
+                if (eventConfig.Plugin.UseScoreLimit)
+                    AddInputField(container, panel, i += 1, "Score Limit", "scoreLimit", eventConfig.ScoreLimit);
+
+                AddInputField(container, panel, i += 1, "Minimum Players", "minimumPlayers", eventConfig.MinimumPlayers);
+                AddInputField(container, panel, i += 1, "Maximum Players", "maximumPlayers", eventConfig.MaximumPlayers);
+
+                List<EventManager.EventParameter> eventParameters = eventConfig.Plugin.AdditionalParameters;
+
+                for (int y = 0; y < eventParameters?.Count; y++)
+                {
+                    EventManager.EventParameter eventParameter = eventParameters[y];
+
+                    switch (eventParameter.Input)
+                    {
+                        case EventManager.EventParameter.InputType.InputField:
+                            {
+                                string parameter = eventConfig.GetParameter<string>(eventParameter.Field);
+                                AddInputField(container, panel, i += 1, eventParameter.Name, eventParameter.Field, string.IsNullOrEmpty(parameter) ? null : parameter);
+                                break;
+                            }
+                        case EventManager.EventParameter.InputType.Toggle:
+                            {
+                                bool parameter = eventConfig.GetParameter<bool>(eventParameter.Field);
+                                AddToggleField(container, panel, i += 1, eventParameter.Name, eventParameter.Field, parameter);
+                                break;
+                            }
+                        case EventManager.EventParameter.InputType.Selector:
+                            {
+                                string parameter = eventConfig.GetParameter<string>(eventParameter.Field);
+                                AddSelectorField(container, panel, i += 1, eventParameter.Name, eventParameter.Field, parameter, eventParameter.SelectorHook);
+                            }
+                            break;
+                    }
+                }
+            }
+        }
+
+        private void AddInputField(CuiElementContainer container, string panel, int index, string title, string fieldName, object currentValue)
+        {
+            float yMin = GetVerticalPos(index >= 21 ? index - 20 : index, 0.836f);
+            float hMin = index >= 21 ? 0.59f : 0.182f;
+
+            UI.Label(container, panel, title, 12, new UI4(hMin, yMin, hMin + 0.118f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+
+            UI.Panel(container, panel, Configuration.Menu.Button.Get, new UI4(hMin + 0.118f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT));
+
+            string label = GetInputLabel(currentValue);
+            if (!string.IsNullOrEmpty(label))
+            {
+                UI.Label(container, panel, label, 12, new UI4(hMin + 0.123f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+                UI.Button(container, panel, Configuration.Menu.Highlight.Get, "X", 12, new UI4(hMin + 0.38f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT), $"emui.clear {fieldName}");
+            }
+            else UI.Input(container, panel, string.Empty, 12, $"emui.creator {fieldName}", new UI4(hMin + 0.123f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT));
+        }
+
+        private void AddLabelField(CuiElementContainer container, string panel, int index, string title, string value)
+        {
+            float yMin = GetVerticalPos(index >= 21 ? index - 20 : index, 0.836f);
+            float hMin = index >= 21 ? 0.59f : 0.182f;
+
+            UI.Label(container, panel, title, 12, new UI4(hMin, yMin, hMin + 0.118f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+
+            UI.Panel(container, panel, Configuration.Menu.Button.Get, new UI4(hMin + 0.118f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT));
+            UI.Label(container, panel, value, 12, new UI4(hMin + 0.123f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+        }
+
+        private void AddToggleField(CuiElementContainer container, string panel, int index, string title, string fieldName, bool currentValue)
+        {
+            float yMin = GetVerticalPos(index >= 21 ? index - 20 : index, 0.836f);
+            float hMin = index >= 21 ? 0.59f : 0.182f;
+
+            UI.Label(container, panel, title, 12, new UI4(hMin, yMin, hMin + 0.118f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+            UI.Toggle(container, panel, Configuration.Menu.Button.Get, 12, new UI4(hMin + 0.118f, yMin, hMin + 0.138f, yMin + ELEMENT_HEIGHT), $"emui.creator {fieldName} {!currentValue}", currentValue);
+        }
+
+        private void AddSelectorField(CuiElementContainer container, string panel, int index, string title, string fieldName, string currentValue, string hook, bool allowMultiple = false)
+        {
+            float yMin = GetVerticalPos(index >= 21 ? index - 20 : index, 0.836f);
+            float hMin = index >= 21 ? 0.59f : 0.182f;
+
+            UI.Label(container, panel, title, 12, new UI4(hMin, yMin, hMin + 0.118f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+
+            UI.Panel(container, panel, Configuration.Menu.Button.Get, new UI4(hMin + 0.118f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT));
+
+            if (!string.IsNullOrEmpty(currentValue))
+                UI.Label(container, panel, currentValue.ToString(), 12, new UI4(hMin + 0.123f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
+
+            UI.Button(container, panel, Configuration.Menu.Highlight.Get, "Select", 12, new UI4(hMin + 0.35f, yMin, hMin + 0.4f, yMin + ELEMENT_HEIGHT), $"emui.fieldselector {CommandSafe(title)} {fieldName} {hook} {allowMultiple}");
+        }
+
+        private string GetSelectorLabel(IEnumerable<object> list) => list.Count() == 0 ? "Nothing Selected" : list.Count() > 1 ? "Multiple Selected" : list.ElementAt(0).ToString();
+
+        private string GetInputLabel(object obj)
+        {
+            if (obj is string)
+                return string.IsNullOrEmpty(obj as string) ? null : obj.ToString();
+            else if (obj is int)
+                return (int)obj <= 0 ? null : obj.ToString();
+            else if (obj is float)
+                return (float)obj <= 0 ? null : obj.ToString();
+            return null;
+        }
+
+        #region Selector
+        private void OpenEventSelector(BasePlayer player, CuiElementContainer container, string panel, SelectorArgs args, int page)
+        {
+            UI.Label(container, UI_MENU, args.Title, 13, new UI4(0.182f, 0.845f, 0.99f, 0.885f), TextAnchor.MiddleLeft);
+
+            int i = 0;
+            foreach (KeyValuePair<string, EventManager.EventConfig> kvp in EventManager.Instance.Events.events)
+            {
+                UI.Button(container, panel, Configuration.Menu.Button.Get, $"{kvp.Key} <size=8>({kvp.Value.EventType})</size>", 11, GetGridLayout(i, 0.182f, 0.796f, 0.1578f, 0.035f, 5, 20), $"{args.Callback} {CommandSafe(kvp.Key)}");
                 i++;
-            }
-
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.5 0.01", "0.99 0.99");
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Leader Board", player), 20, "0.6 0.92", "0.9 0.98");
-            GetLeaderBoard(ref MainCont, UIPanel);
-
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
+            }            
         }
 
-        private void CreateAdminMenu(BasePlayer player)
-        {            
-            var MenuElement = EventManager.UI.CreateElementContainer(UIAdmin, UIColors["dark"], "0.88 0", "1 0.92", true);
-            EventManager.UI.CreatePanel(ref MenuElement, UIAdmin, UIColors["light"], "0.01 0.01", "0.91 0.99", true);
+        private void OpenSelector(BasePlayer player, CuiElementContainer container, string panel, SelectorArgs args, int page)
+        {
+            UI.Label(container, UI_MENU, args.Title, 13, new UI4(0.182f, 0.845f, 0.99f, 0.885f), TextAnchor.MiddleLeft);
 
+            UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "Back", 12, new UI4(0.925f, 0.845f, 0.995f, 0.885f), "emui.closeselector");
+
+            string[] array = Interface.CallHook(args.Hook) as string[];
+            if (array != null)
+            {
+                EventManager.EventConfig eventConfig;
+                _eventCreators.TryGetValue(player.userID, out eventConfig);
+
+                string stringValue = eventConfig.GetString(args.FieldName);
+                List<string> listValue = eventConfig?.GetList(args.FieldName);
+
+                int count = 0;
+                for (int i = page * 200; i < Mathf.Min((page + 1) * 200, array.Length); i++)
+                {
+                    string option = array[i];
+
+                    string color = ((stringValue?.Equals(option, StringComparison.OrdinalIgnoreCase) ?? false) || (listValue?.Contains(option)?? false)) ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get;
+
+                    UI.Button(container, panel, color, array[i], 11, GetGridLayout(count), $"emui.select {CommandSafe(args.Title)} {args.FieldName} {args.Hook} {args.AllowMultiple} {CommandSafe(option)}");
+                    count += 1;
+                }
+            }
+            else
+            {
+                UI.Label(container, UI_MENU, "No options available for selection", 13, new UI4(0.182f, 0.796f, 0.99f, 0.836f), TextAnchor.MiddleLeft);
+            }
+        }
+
+        private UI4 GetGridLayout(int index, float xMin = 0.182f, float yMin = 0.796f, float width = 0.0764f, float height = 0.035f, int columns = 10, int rows = 20)
+        {
+            int columnNumber = index == 0 ? 0 : Mathf.FloorToInt(index / (float)columns);
+            int rowNumber = index - (columnNumber * columns);
+
+            float x = xMin + ((width + 0.005f) * rowNumber);
+            float y = yMin - ((height + 0.0075f) * columnNumber);
+
+            return new UI4(x, y, x + width, y + height);
+        }
+
+        private UI4 GetGridLayout(int columnNumber, int rowNumber, float xMin = 0.182f, float yMin = 0.796f, float width = 0.0764f, float height = 0.035f, int columns = 10, int rows = 20)
+        {            
+            float x = xMin + ((width + 0.005f) * rowNumber);
+            float y = yMin - ((height + 0.0075f) * columnNumber);
+
+            return new UI4(x, y, x + width, y + height);
+        }
+        #endregion        
+        #endregion        
+        #endregion
+
+        #region Statistics      
+        private void CreateStatisticsMenu(BasePlayer player, CuiElementContainer container, MenuArgs args)
+        {
+            AddStatisticHeader(container, player.userID, args.Statistic);            
+
+            switch (args.Statistic)
+            {
+                case StatisticTab.Personal:
+                    AddStatistics(container, false, player.userID, args.Page);
+                    break;
+                case StatisticTab.Global:
+                    AddStatistics(container, true, player.userID, args.Page);
+                    break;
+                case StatisticTab.Leaders:
+                    AddLeaderBoard(container, player.userID, args.Page, args.StatisticSort);
+                    break;  
+            }
+        }
+
+        private void AddStatisticHeader(CuiElementContainer container, ulong playerId, StatisticTab openTab)
+        {
             int i = 0;
-            CreateAdminButton(ref MenuElement, UIAdmin, "Control", "EMI_ChangeElement control", i); i++;
-            CreateAdminButton(ref MenuElement, UIAdmin, "Kick", "EMI_ChangeElement kick", i); i++;
-            CreateAdminButton(ref MenuElement, UIAdmin, "Join", "EMI_ChangeElement join", i); i++; i++;
-            CreateAdminButton(ref MenuElement, UIAdmin, "Classes", "EMI_ChangeElement class", i); i++; i++;
+            float xMin = GetHorizontalPos(i);
 
-            CreateAdminButton(ref MenuElement, UIAdmin, "Events", "EMI_ChangeElement events", i); i++;
-            CreateAdminButton(ref MenuElement, UIAdmin, "Create", "EMI_ChangeElement createevent", i); i++;i++;
+            UI.Button(container, UI_MENU, openTab == StatisticTab.Personal ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Statistics.Personal", playerId), 13, new UI4(xMin, 0.85f, xMin + 0.14f, 0.885f), openTab == StatisticTab.Personal ? "" : $"emui.statistics {(int)StatisticTab.Personal} {EventStatistics.Statistic.Rank}");
+            xMin = GetHorizontalPos(i += 1) + (0.002f * i);
 
-            CreateAdminButton(ref MenuElement, UIAdmin, "Auto Events", "EMI_ChangeElement auto", i); i++; 
+            UI.Button(container, UI_MENU, openTab == StatisticTab.Global ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Statistics.Global", playerId), 13, new UI4(xMin, 0.85f, xMin + 0.14f, 0.885f), openTab == StatisticTab.Global ? "" : $"emui.statistics {(int)StatisticTab.Global} {EventStatistics.Statistic.Rank}");
+            xMin = GetHorizontalPos(i += 1) + (0.002f * i);
 
-            CuiHelper.DestroyUi(player, UIAdmin);
-            CuiHelper.AddUi(player, MenuElement);
-            EventControl(player);
+            UI.Button(container, UI_MENU, openTab == StatisticTab.Leaders ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Statistics.Leaders", playerId), 13, new UI4(xMin, 0.85f, xMin + 0.14f, 0.885f), openTab == StatisticTab.Leaders ? "" : $"emui.statistics {(int)StatisticTab.Leaders} {EventStatistics.Statistic.Rank}");
+            xMin = GetHorizontalPos(i += 1) + (0.002f * i);
         }
-        private void EventControl(BasePlayer player)
+
+        private void AddStatistics(CuiElementContainer container, bool isGlobal, ulong playerId, int page = 0)
         {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("ControlHelp", player), 18, "0.2 0.92", "0.8 0.98");
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.005f, 0.805f, 0.499f, 0.845f));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Button.Get, new UI4(0.501f, 0.805f, 0.995f, 0.845f));
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.005f, 0.801f, 0.995f, 0.804f));
 
-            int i = 1;
-            int p = 0;
-            AddInfoEntry(ref MainCont, UIPanel, msg("Event Status", player), GetEventStatus(), i); i++;
+            UI.Label(container, UI_MENU, isGlobal ? Message("UI.Statistics.Global", playerId) : Message("UI.Statistics.Personal", playerId), 13, new UI4(0.01f, 0.805f, 0.499f, 0.845f), TextAnchor.MiddleLeft);
+            UI.Label(container, UI_MENU, Message("UI.GamesPlayed", playerId), 13, new UI4(0.506f, 0.805f, 0.995f, 0.845f), TextAnchor.MiddleLeft);
 
-            if (!string.IsNullOrEmpty(EventManager._Event.EventType))
+            EventStatistics.Statistics.Data data = isGlobal ? EventStatistics.Data.global : EventStatistics.Data.Find(playerId);
+            if (data != null)
             {
-                if (!EventManager._Open) { CreateControlButton(ref MainCont, UIPanel, msg("Open", player), "EMI_Control open", 0.83f, p); p++; }
-                if (EventManager._Open) { CreateControlButton(ref MainCont, UIPanel, msg("Close", player), "EMI_Control close", 0.83f, p); p++; }
-                if (EventManager._Open && !EventManager._Started) { CreateControlButton(ref MainCont, UIPanel, msg("Start", player), "EMI_Control start", 0.83f, p); p++; }
-                if (EventManager._Started) { CreateControlButton(ref MainCont, UIPanel, msg("End", player), "EMI_Control end", 0.83f, p); p++; }
-            }
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Select a event config or event type to proceed", player), 18, "0.5 0.82", "0.9 0.88", TextAnchor.MiddleLeft);
-
-            AddInfoEntry(ref MainCont, UIPanel, msg("Event Config", player), EventManager._CurrentEventConfig, i); 
-            CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Control config", 0.88f - (0.05f * i), 0); i++;
-            AddInfoEntry(ref MainCont, UIPanel, msg("Event Type", player), EventManager._Event.EventType, i);
-            CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Control type", 0.88f - (0.05f * i), 0); i++;
-
-            if (!string.IsNullOrEmpty(EventManager._Event.EventType))
-            {
-                if (EventManager.EventGames[EventManager._Event.EventType].CanPlayBattlefield)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Gamemode", player), EventManager._Event.GameMode.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Normal", player), $"EMI_Control gamemode normal", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Battlefield", player), $"EMI_Control gamemode battlefield", 0.88f - (0.05f * i), 1); i++;
-                }
-
-                if (!string.IsNullOrEmpty(EventManager.EventGames[EventManager._Event.EventType].ScoreType) && EventManager._Event.GameMode != EventManager.GameMode.Battlefield)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, $"{msg("Score Limit", player)} ({EventManager.EventGames[EventManager._Event.EventType].ScoreType})", EventManager._Event.ScoreLimit.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, "+", $"EMI_Control scorelimit {EventManager._Event.ScoreLimit + 1}", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, "-", $"EMI_Control scorelimit {EventManager._Event.ScoreLimit - 1}", 0.88f - (0.05f * i), 1); i++;
-                }
-
-                AddInfoEntry(ref MainCont, UIPanel, msg("Max Players", player), EventManager._Event.MaximumPlayers.ToString(), i);
-                CreateControlButton(ref MainCont, UIPanel, "+", $"EMI_Control maxplayers {EventManager._Event.MaximumPlayers + 1}", 0.88f - (0.05f * i), 0);
-                CreateControlButton(ref MainCont, UIPanel, "-", $"EMI_Control maxplayers {EventManager._Event.MaximumPlayers - 1}", 0.88f - (0.05f * i), 1); i++;
-
-                if (EventManager._Event.EventType == "GunGame")
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Weapon Set", player), EventManager._Event.WeaponSet, i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Control ggconfig", 0.88f - (0.05f * i), 0); i++;
-                }
-                else if (EventManager.EventGames[EventManager._Event.EventType].RequiresKit && !EventManager._Event.UseClassSelector)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Kit", player), EventManager._Event.Kit, i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Control kit", 0.88f - (0.05f * i), 0); i++;
-                }
-                if (EventManager.EventGames[EventManager._Event.EventType].RequiresSpawns)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Spawnfile", player), EventManager._Event.Spawnfile, i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Control spawns", 0.88f - (0.05f * i), 0); i++;
-
-                    if (EventManager.EventGames[EventManager._Event.EventType].RequiresMultipleSpawns)
-                    {
-                        AddInfoEntry(ref MainCont, UIPanel, msg("Second Spawnfile", player), EventManager._Event.Spawnfile2, i);
-                        CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Control spawns2", 0.88f - (0.05f * i), 0); i++;
-                    }
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Spawn Type", player), EventManager._Event.SpawnType.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Consecutive", player), "EMI_Control spawntype seq", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Random", player), "EMI_Control spawntype rand", 0.88f - (0.05f * i), 1); i++;
-                }                         
-
-                AddInfoEntry(ref MainCont, UIPanel, msg("Zone ID", player), EventManager._Event.ZoneID, i);
-                CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Control zone", 0.88f - (0.05f * i), 0); i++;
-
-                if (EventManager.EventGames[EventManager._Event.EventType].SpawnsEnemies)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Enemies to spawn", player), EventManager._Event.EnemiesToSpawn.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, "+", $"EMI_Control enemycount {EventManager._Event.EnemiesToSpawn + 1}", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, "-", $"EMI_Control enemycount {EventManager._Event.EnemiesToSpawn - 1}", 0.88f - (0.05f * i), 1); i++;
-                }
-                if (EventManager.EventGames[EventManager._Event.EventType].IsRoundBased)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Rounds to play", player), EventManager._Event.GameRounds.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, "+", $"EMI_Control roundcount {EventManager._Event.GameRounds + 1}", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, "-", $"EMI_Control roundcount {EventManager._Event.GameRounds - 1}", 0.88f - (0.05f * i), 1); i++;
-                }
-
-                if (EventManager.EventGames[EventManager._Event.EventType].CanUseClassSelector)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Class Selector", player), EventManager._Event.UseClassSelector.ToString(), i);
-                    if (!EventManager._Event.UseClassSelector) CreateControlButton(ref MainCont, UIPanel, msg("Enable", player), "EMI_Control classtoggle", 0.88f - (0.05f * i), 0);
-                    else CreateControlButton(ref MainCont, UIPanel, msg("Disable", player), "EMI_Control classtoggle", 0.88f - (0.05f * i), 0); i++;
-                }
-
-                AddInfoEntry(ref MainCont, UIPanel, msg("Disable Item Pickup", player), EventManager._Event.DisableItemPickup.ToString(), i);
-                if (!EventManager._Event.DisableItemPickup) CreateControlButton(ref MainCont, UIPanel, msg("Enable", player), "EMI_Control pickuptoggle", 0.88f - (0.05f * i), 0);
-                else CreateControlButton(ref MainCont, UIPanel, msg("Disable", player), "EMI_Control pickuptoggle", 0.88f - (0.05f * i), 0); i++;
-
-                if (!EventManager.EventGames[EventManager._Event.EventType].ForceCloseOnStart)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Close On Start", player), EventManager._Event.CloseOnStart.ToString(), i);
-                    if (!EventManager._Event.CloseOnStart) CreateControlButton(ref MainCont, UIPanel, msg("Enable", player), "EMI_Control costoggle", 0.88f - (0.05f * i), 0);
-                    else CreateControlButton(ref MainCont, UIPanel, msg("Disable", player), "EMI_Control costoggle", 0.88f - (0.05f * i), 0); i++; i++;
-                }
-                if (EventManager.EventGames[EventManager._Event.EventType].CanChooseRespawn)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Respawn Type", player), EventManager._Event.RespawnType.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("None", player), "EMI_Control respawn none", 0.88f - (0.05f * i), 0); 
-                    CreateControlButton(ref MainCont, UIPanel, msg("Timer", player), "EMI_Control respawn timer", 0.88f - (0.05f * i), 1); 
-                    CreateControlButton(ref MainCont, UIPanel, msg("Waves", player), "EMI_Control respawn wave", 0.88f - (0.05f * i), 2); i++;
-
-                    if (EventManager._Event.RespawnType != EventManager.RespawnType.None)
-                    {
-                        AddInfoEntry(ref MainCont, UIPanel, msg("Respawn Timer (seconds)", player), EventManager._Event.RespawnTimer.ToString(), i);
-                        CreateControlButton(ref MainCont, UIPanel, "+", $"EMI_Control respawntime {EventManager._Event.RespawnTimer + 1}", 0.88f - (0.05f * i), 0);
-                        CreateControlButton(ref MainCont, UIPanel, "-", $"EMI_Control respawntime {EventManager._Event.RespawnTimer - 1}", 0.88f - (0.05f * i), 1); i++;
-                    }
-                }
-            }        
-
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }                
-        private void EventClasses(BasePlayer player)
-        {            
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Add or remove kits from the class selector", player), 18, "0.2 0.92", "0.8 0.98");
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Available Kits", player), 18, "0.05 0.86", "0.76 0.92");
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Available Classes", player), 18, "0.8 0.86", "0.95 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["medium"], "0.05 0.05", "0.76 0.85", true);
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["medium"], "0.8 0.05", "0.95 0.85", true);
-            var classList = Event_Config.Classes;
-            var kitList = GetKits();
-            var Kits = GetKits();
-            if (Kits != null && Kits is string[])
-            {
-                int i = 0;                
-                foreach (var kit in (string[])Kits)
-                {
-                    if (classList.Contains(kit)) continue;
-                    CreateClassEditorButton(ref MainCont, UIPanel, kit, i, true);
-                    i++;
-                }
-                if (i == 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Unable to find any kits", player), 18, "0.1 0.5", "0.45 0.6");
-            }
-            if (classList != null)
-            {
-                int i = 0;
-                foreach (var entry in classList)
-                {                    
-                    CreateClassEditorButton(ref MainCont, UIPanel, entry, i, false);
-                    i++;
-                }
-                if (i == 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("No classes have been added", player), 18, "0.6 0.5", "0.9 0.6");
-            } 
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void EventAutoEvent(BasePlayer player, int page = 0)
-        {
-            if (!AutoCreators.ContainsKey(player.userID))
-                AutoCreators.Add(player.userID, new AEConfig());
-            var autocfg = AutoCreators[player.userID];
-
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Manage the auto event roster and settings", player), 18, "0.2 0.92", "0.8 0.98");
-            
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Auto-Event Settings", player), 18, "0.05 0.86", "0.45 0.92");
-            int info = 2;
-            AddInfoAuto(ref MainCont, UIPanel, msg("Auto-Event Status", player), GetAutoEventStatus(), info);
-            if (!EventManager._Launched) CreateControlButtonSmall(ref MainCont, UIPanel, msg("Enable", player), "EMI_Control aeenable", 0.88f - (0.06f * info), 0);
-            else CreateControlButtonSmall(ref MainCont, UIPanel, msg("Disable", player), "EMI_Control aedisable", 0.88f - (0.06f * info), 0); info++;
-
-            AddInfoAuto(ref MainCont, UIPanel, msg("Next Event", player), EventManager._NextConfigName, info);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Change", player), "EMI_Control nextevent", 0.88f - (0.06f * info), 0); info++;
-
-            AddInfoAuto(ref MainCont, UIPanel, msg("Auto Cancel", player), Event_Config.AutoEvent_Config.AutoCancel.ToString(), info); 
-            if (Event_Config.AutoEvent_Config.AutoCancel) CreateControlButtonSmall(ref MainCont, UIPanel, msg("Disable", player), "EMI_AutoEditor cancel 1", 0.88f - (0.06f * info), 0);
-            else CreateControlButtonSmall(ref MainCont, UIPanel, msg("Enable", player), "EMI_AutoEditor cancel 1", 0.88f - (0.06f * info), 0); info++;
-
-            AddInfoAuto(ref MainCont, UIPanel, msg("Game Interval (minutes)", player), Event_Config.AutoEvent_Config.GameInterval.ToString(), info);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Increase", player), $"EMI_AutoEditor gameinterval {Event_Config.AutoEvent_Config.GameInterval + 1}", 0.88f - (0.06f * info), 0);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Decrease", player), $"EMI_AutoEditor gameinterval {Event_Config.AutoEvent_Config.GameInterval - 1}", 0.88f - (0.06f * info), 1); info++;
-
-            AddInfoAuto(ref MainCont, UIPanel, msg("Auto Cancel Timer (minutes)", player), Event_Config.AutoEvent_Config.AutoCancel_Timer.ToString(), info);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Increase", player), $"EMI_AutoEditor canceltimer {Event_Config.AutoEvent_Config.AutoCancel_Timer + 1}", 0.88f - (0.06f * info), 0);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Decrease", player), $"EMI_AutoEditor canceltimer {Event_Config.AutoEvent_Config.AutoCancel_Timer - 1}", 0.88f - (0.06f * info), 1); info++;
-
-            AddInfoAuto(ref MainCont, UIPanel, msg("Randomize List", player), EventManager._RandomizeAuto.ToString(), info);
-            if (EventManager._RandomizeAuto) CreateControlButtonSmall(ref MainCont, UIPanel, msg("Disable", player), "EMI_AutoEditor randomize 1", 0.88f - (0.06f * info), 0);
-            else CreateControlButtonSmall(ref MainCont, UIPanel, msg("Enable", player), "EMI_AutoEditor randomize 1", 0.88f - (0.06f * info), 0); info++;
-
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Auto-Event Creator", player), 18, "0.05 0.36", "0.45 0.42");
-
-            info = 10;
-            AddInfoAuto(ref MainCont, UIPanel, msg("Event Config", player), autocfg.EventConfig, info);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Change", player), "EMI_NewAutoConfig newconf", 0.88f - (0.06f * info), 0); info++;
-
-            AddInfoAuto(ref MainCont, UIPanel, msg("Join Timer (seconds)", player), autocfg.TimeToJoin.ToString(), info);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Increase", player), $"EMI_NewAutoConfig jointimer {autocfg.TimeToJoin + 1}", 0.88f - (0.06f * info), 0);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Decrease", player), $"EMI_NewAutoConfig jointimer {autocfg.TimeToJoin - 1}", 0.88f - (0.06f * info), 1); info++;
-
-            AddInfoAuto(ref MainCont, UIPanel, msg("Start Timer (seconds)", player), autocfg.TimeToStart.ToString(), info);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Increase", player), $"EMI_NewAutoConfig starttimer {autocfg.TimeToStart + 1}", 0.88f - (0.06f * info), 0);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Decrease", player), $"EMI_NewAutoConfig starttimer {autocfg.TimeToStart - 1}", 0.88f - (0.06f * info), 1); info++;
-
-            AddInfoAuto(ref MainCont, UIPanel, msg("Time Limit (minutes)", player), autocfg.TimeLimit.ToString(), info);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Increase", player), $"EMI_NewAutoConfig timelimit {autocfg.TimeLimit + 1}", 0.88f - (0.06f * info), 0);
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Decrease", player), $"EMI_NewAutoConfig timelimit {autocfg.TimeLimit - 1}", 0.88f - (0.06f * info), 1); info++;
-
-            CreateControlButtonSmall(ref MainCont, UIPanel, msg("Save Config", player), $"EMI_NewAutoConfig saveconfig {autocfg.TimeLimit + 1}", 0.88f - (0.06f * info), 0);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Auto-Event Roster", player), 18, "0.45 0.86", "0.98 0.92");            
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["medium"], "0.45 0.075", "0.98 0.85", true);
-
-
-            var autoList = Event_Config.AutoEvent_Config.AutoEvent_List;            
-            if (autoList != null)
-            {
-                if (autoList.Count > 12)
-                {
-                    var maxpages = (autoList.Count - 1) / 12 + 1;
-                    if (page < maxpages - 1)
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Next", player), 18, "0.84 0.015", "0.97 0.07", $"EMI_ChangePage autoevent {page + 1}");
-                    if (page > 0)
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Back", player), 18, "0.46 0.015", "0.59 0.07", $"EMI_ChangePage autoevent {page - 1}");
-                }
-                int maxentries = (12 * (page + 1));
-                if (maxentries > autoList.Count)
-                    maxentries = autoList.Count;
-                int autocount = 12 * page;
-
-                int i = 0;
-                for (int n = autocount; n < maxentries; n++)
-                {
-                    CreateAutoEventEditorButton(ref MainCont, UIPanel, autoList[n], i, n);
-                    i++;
-                }
-                if (i == 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("No auto events have been added", player), 18, "0.5 0.5", "0.9 0.6");
-            }
-
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void EventCreator(BasePlayer player, int page = 0)
-        {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-
-            var infoMessage = msg("CreateHelp", player);
-
-            int i = 1;
-            var newEvent = EventCreators[player.userID];      
-                        
-            AddInfoEntry(ref MainCont, UIPanel, msg("Event Type", player), newEvent.EventType, i);
-            CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Creator type", 0.88f - (0.05f * i), 0); i++;
-
-            if (!string.IsNullOrEmpty(newEvent.EventType))
-            {
-                infoMessage = msg("CreateHelp2", player);
-                if (newEvent.EventType == "GunGame")
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Weapon Set", player), newEvent.WeaponSet, i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Creator ggconfig", 0.88f - (0.05f * i), 0); i++;
-                }
-                else if (EventManager.EventGames[newEvent.EventType].RequiresKit && !newEvent.UseClassSelector)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Kit", player), newEvent.Kit, i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Creator kit", 0.88f - (0.05f * i), 0); i++;
-                }
-                if (EventManager.EventGames[newEvent.EventType].RequiresSpawns)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Spawnfile", player), newEvent.Spawnfile, i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Creator spawns", 0.88f - (0.05f * i), 0); i++;
-
-                    if (EventManager.EventGames[newEvent.EventType].RequiresMultipleSpawns)
-                    {
-                        AddInfoEntry(ref MainCont, UIPanel, msg("Second Spawnfile", player), newEvent.Spawnfile2, i);
-                        CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Creator spawns2", 0.88f - (0.05f * i), 0); i++;
-                    }
-
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Spawn Type", player), newEvent.SpawnType.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Consecutive", player), "EMI_Creator spawntype seq", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Random", player), "EMI_Creator spawntype rand", 0.88f - (0.05f * i), 1); i++;
-                }
-                
-
-                AddInfoEntry(ref MainCont, UIPanel, msg("Zone ID", player), newEvent.ZoneID, i);
-                CreateControlButton(ref MainCont, UIPanel, msg("Change", player), "EMI_Creator zone", 0.88f - (0.05f * i), 0); i++;
-
-                if (EventManager.EventGames[newEvent.EventType].CanPlayBattlefield)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Gamemode", player), newEvent.GameMode.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Normal", player), $"EMI_Creator gamemode normal", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Battlefield", player), $"EMI_Creator gamemode battlefield", 0.88f - (0.05f * i), 1); i++;
-                }
-
-                if (!string.IsNullOrEmpty(EventManager.EventGames[newEvent.EventType].ScoreType) && newEvent.GameMode != EventManager.GameMode.Battlefield)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, $"{msg("Score Limit", player)} ({EventManager.EventGames[newEvent.EventType].ScoreType})", newEvent.ScoreLimit.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Increase", player), $"EMI_Creator scorelimit {newEvent.ScoreLimit + 1}", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Decrease", player), $"EMI_Creator scorelimit {newEvent.ScoreLimit - 1}", 0.88f - (0.05f * i), 1); i++;
-                }
-
-                AddInfoEntry(ref MainCont, UIPanel, msg("Min Players", player), newEvent.MinimumPlayers.ToString(), i);
-                CreateControlButton(ref MainCont, UIPanel, msg("Increase", player), $"EMI_Creator min {newEvent.MinimumPlayers + 1}", 0.88f - (0.05f * i), 0);
-                CreateControlButton(ref MainCont, UIPanel, msg("Decrease", player), $"EMI_Creator min {newEvent.MinimumPlayers - 1}", 0.88f - (0.05f * i), 1); i++;
-
-                AddInfoEntry(ref MainCont, UIPanel, msg("Max Players", player), newEvent.MaximumPlayers.ToString(), i);
-                CreateControlButton(ref MainCont, UIPanel, msg("Increase", player), $"EMI_Creator max {newEvent.MaximumPlayers + 1}", 0.88f - (0.05f * i), 0);
-                CreateControlButton(ref MainCont, UIPanel, msg("Decrease", player), $"EMI_Creator max {newEvent.MaximumPlayers - 1}", 0.88f - (0.05f * i), 1); i++;
-
-                if (EventManager.EventGames[newEvent.EventType].SpawnsEnemies)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Enemies to spawn", player), newEvent.EnemiesToSpawn.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, "+", $"EMI_Creator enemycount {newEvent.EnemiesToSpawn + 1}", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, "-", $"EMI_Creator enemycount {newEvent.EnemiesToSpawn - 1}", 0.88f - (0.05f * i), 1); i++;
-                }
-                if (EventManager.EventGames[newEvent.EventType].IsRoundBased)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Rounds to play", player), newEvent.GameRounds.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, "+", $"EMI_Creator roundcount {newEvent.GameRounds + 1}", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, "-", $"EMI_Creator roundcount {newEvent.GameRounds - 1}", 0.88f - (0.05f * i), 1); i++;
-                }
-
-                if (EventManager.EventGames[newEvent.EventType].CanUseClassSelector)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Class Selector", player), newEvent.UseClassSelector.ToString(), i);
-                    if (!newEvent.UseClassSelector) CreateControlButton(ref MainCont, UIPanel, msg("Enable", player), "EMI_Creator classtoggle", 0.88f - (0.05f * i), 0);
-                    else CreateControlButton(ref MainCont, UIPanel, msg("Disable", player), "EMI_Creator classtoggle", 0.88f - (0.05f * i), 0); i++;
-                }
-
-                AddInfoEntry(ref MainCont, UIPanel, msg("Disable Item Pickup", player), newEvent.DisableItemPickup.ToString(), i);
-                if (!newEvent.DisableItemPickup) CreateControlButton(ref MainCont, UIPanel, msg("Enable", player), "EMI_Creator pickuptoggle", 0.88f - (0.05f * i), 0);
-                else CreateControlButton(ref MainCont, UIPanel, msg("Disable", player), "EMI_Creator pickuptoggle", 0.88f - (0.05f * i), 0); i++;
-
-                if (!EventManager.EventGames[newEvent.EventType].ForceCloseOnStart)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Close On Start", player), newEvent.CloseOnStart.ToString(), i);
-                    if (!newEvent.CloseOnStart) CreateControlButton(ref MainCont, UIPanel, msg("Enable", player), "EMI_Creator costoggle", 0.88f - (0.05f * i), 0);
-                    else CreateControlButton(ref MainCont, UIPanel, msg("Disable", player), "EMI_Creator costoggle", 0.88f - (0.05f * i), 0); i++;
-                }
-                if (EventManager.EventGames[newEvent.EventType].CanChooseRespawn)
-                {
-                    AddInfoEntry(ref MainCont, UIPanel, msg("Respawn Type", player), newEvent.RespawnType.ToString(), i);
-                    CreateControlButton(ref MainCont, UIPanel, msg("None", player), "EMI_Creator respawn none", 0.88f - (0.05f * i), 0);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Timer", player), "EMI_Creator respawn timer", 0.88f - (0.05f * i), 1);
-                    CreateControlButton(ref MainCont, UIPanel, msg("Waves", player), "EMI_Creator respawn wave", 0.88f - (0.05f * i), 2); i++;
-
-                    if (newEvent.RespawnType != EventManager.RespawnType.None)
-                    {
-                        AddInfoEntry(ref MainCont, UIPanel, msg("Respawn Timer (seconds)", player), newEvent.RespawnTimer.ToString(), i);
-                        CreateControlButton(ref MainCont, UIPanel, "+", $"EMI_Creator respawntime {newEvent.RespawnTimer + 1}", 0.88f - (0.05f * i), 0);
-                        CreateControlButton(ref MainCont, UIPanel, "-", $"EMI_Creator respawntime {newEvent.RespawnTimer - 1}", 0.88f - (0.05f * i), 1); i++;
-                    }
-                }
-                EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Save Config", player), 18, "0.84 0.015", "0.97 0.07", $"EMI_Creator saveconf");
-            }
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", infoMessage, 18, "0.1 0.92", "0.9 0.98");
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void EventRemover(BasePlayer player, int page = 0)
-        {
-            DestroyEntries(player);
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Remove created event configs using the remove button", player), 18, "0.2 0.92", "0.8 0.98");
-
-            if (Event_Config.Event_List.Count > 9)
-            {
-                var maxpages = (Event_Config.Event_List.Count - 1) / 9 + 1;
-                if (page < maxpages - 1)
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Next", player), 18, "0.84 0.925", "0.97 0.98", $"EMI_ChangePage remover {page + 1}");
+                const int ELEMENTS_PER_PAGE = 19;
+                                
+                if (data.events.Count > (ELEMENTS_PER_PAGE * page) + ELEMENTS_PER_PAGE)
+                    UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "> > >", 10, new UI4(0.911f, 0.0075f, 0.995f, 0.0375f), 
+                        $"emui.statistics {(isGlobal ? (int)StatisticTab.Global : (int)StatisticTab.Personal)} {page + 1}");
                 if (page > 0)
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Back", player), 18, "0.03 0.925", "0.16 0.98", $"EMI_ChangePage remover {page - 1}");
+                    UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "< < <", 10, new UI4(0.005f, 0.0075f, 0.089f, 0.0375f), 
+                        $"emui.statistics {(isGlobal ? (int)StatisticTab.Global : (int)StatisticTab.Personal)} {page - 1}");
+
+                int i = 0;
+                if (!isGlobal)
+                {
+                    CreateListEntryLeft(container, Message("UI.Rank", playerId), data.Rank == -1 ? "-" : data.Rank.ToString(), GetVerticalPos(i+=1, 0.801f));
+                    CreateListEntryLeft(container, Message("UI.Score", playerId), data.Score.ToString(), GetVerticalPos(i+=1, 0.801f));
+                }
+
+                foreach (KeyValuePair<string, int> score in data.statistics)                
+                    CreateListEntryLeft(container, isGlobal ? string.Format(Message("UI.Totals", playerId), score.Key) : Message(score.Key, playerId), score.Value.ToString(), GetVerticalPos(i+=1, 0.801f));
+
+                int j = 1;
+                for (int k = page * ELEMENTS_PER_PAGE; k < (page * ELEMENTS_PER_PAGE) + ELEMENTS_PER_PAGE; k++)
+                {
+                    if (k >= data.events.Count)
+                        break;
+
+                    KeyValuePair<string, int> eventGame = data.events.ElementAt(k);
+
+                    CreateListEntryRight(container, eventGame.Key, eventGame.Value.ToString(), GetVerticalPos(j++, 0.801f));
+                }
             }
-            int maxentries = (9 * (page + 1));
-            if (maxentries > Event_Config.Event_List.Count)
-                maxentries = Event_Config.Event_List.Count;
-            int eventcount = 9 * page;            
-
-            if (Event_Config.Event_List.Count == 0)
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("No event configs found", player), 24, "0 0.82", "1 0.9");
-
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-
-            var EventNames = new List<string>();
-            foreach (var entry in Event_Config.Event_List)
-                EventNames.Add(entry.Key);
-            int i = 0;
-            for (int n = eventcount; n < maxentries; n++)
+            else
             {
-                CreateEventEntry(player, EventNames[n], Event_Config.Event_List[EventNames[n]], $"EMI_RemoveEvent {EventNames[n]}", "Remove", i);
-                i++;
+                float yMin = GetVerticalPos(1, 0.801f);
+                UI.Label(container, UI_MENU, Message("UI.NoStatisticsSaved", playerId), 13, new UI4(0.01f, yMin, 0.38f, yMin + ELEMENT_HEIGHT), TextAnchor.MiddleLeft);
             }
         }        
-        public void ClassSelector(BasePlayer player, string Kit = "")
-        {            
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "1 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.155 0.01", "0.99 0.99", true);
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.01 0.01", "0.15 0.99", true);
+        
+        private void AddLeaderBoard(CuiElementContainer container, ulong playerId, int page = 0, EventStatistics.Statistic sortBy = EventStatistics.Statistic.Rank)
+        {
+            const int ELEMENTS_PER_PAGE = 19;
 
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Classes", player), 20, "0.01 0.92", "0.15 0.98");
+            List<EventStatistics.Statistics.Data> list = EventStatistics.Data.SortStatisticsBy(sortBy);
 
-            var currentClass = msg("Select a class from the options on the left", player);
-            if (EventManager.isPlaying(player) && !string.IsNullOrEmpty(EventManager.GetUserClass(player)))            
-                currentClass = $"{msg("Currently Selected Class:", player)} {Color1}{EventManager.GetUserClass(player)}</color>";            
+            if (list.Count > (ELEMENTS_PER_PAGE * page) + ELEMENTS_PER_PAGE)
+                UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "> > >", 10, new UI4(0.911f, 0.0075f, 0.995f, 0.0375f), 
+                    $"emui.statistics {(int)StatisticTab.Leaders} {(int)sortBy} {page + 1}");
+            if (page > 0)
+                UI.Button(container, UI_MENU, Configuration.Menu.Highlight.Get, "< < <", 10, new UI4(0.005f, 0.0075f, 0.089f, 0.0375f), 
+                    $"emui.statistics {(int)StatisticTab.Leaders} {(int)sortBy} {page - 1}");
+
+            float yMin = 0.81f;
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Rank ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, string.Empty, page, EventStatistics.Statistic.Rank, 0.005f, 0.033f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Name ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Player", playerId), page, EventStatistics.Statistic.Name, 0.035f, 0.225f, yMin, TextAnchor.MiddleLeft);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Rank ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Score", playerId), page, EventStatistics.Statistic.Rank, 0.227f, 0.309f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Kills ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Kills", playerId), page, EventStatistics.Statistic.Kills, 0.311f, 0.393f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Deaths ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Deaths", playerId), page, EventStatistics.Statistic.Deaths, 0.395f, 0.479f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Assists ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Assists", playerId), page, EventStatistics.Statistic.Assists, 0.481f, 0.565f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Headshots ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Headshots", playerId), page, EventStatistics.Statistic.Headshots, 0.567f, 0.651f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Melee ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Melee", playerId), page, EventStatistics.Statistic.Melee, 0.653f, 0.737f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Wins ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Won", playerId), page, EventStatistics.Statistic.Wins, 0.739f, 0.823f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Losses ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Lost", playerId), page, EventStatistics.Statistic.Losses, 0.825f, 0.909f, yMin);
+
+            AddLeaderSortButton(container, UI_MENU, sortBy == EventStatistics.Statistic.Played ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Played", playerId), page, EventStatistics.Statistic.Played, 0.911f, 0.995f, yMin);
+
+            UI.Panel(container, UI_MENU, Configuration.Menu.Highlight.Get, new UI4(0.005f, 0.807f, 0.995f, 0.81f));
+
+            int j = 1;
+            for (int i = page * ELEMENTS_PER_PAGE; i < (page * ELEMENTS_PER_PAGE) + ELEMENTS_PER_PAGE; i++)
+            {
+                if (i >= list.Count)
+                    break;
+
+                EventStatistics.Statistics.Data userData = list[i];
+
+                yMin = GetVerticalPos(j, 0.81f);
                 
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Class Selection", player), 20, "0.16 0.92", "0.95 0.98");
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", currentClass, 18, "0.18 0.86", "0.8 0.92", TextAnchor.MiddleLeft);
+                if (userData != null)
+                {
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.Rank.ToString(), 0.005f, 0.033f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.DisplayName ?? "Unknown", 0.035f, 0.225f, yMin, TextAnchor.MiddleLeft);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.Score.ToString(), 0.227f, 0.309f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.GetStatistic("Kills").ToString(), 0.311f, 0.393f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.GetStatistic("Deaths").ToString(), 0.395f, 0.479f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.GetStatistic("Assists").ToString(), 0.481f, 0.565f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.GetStatistic("Headshots").ToString(), 0.567f, 0.651f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.GetStatistic("Melee").ToString(), 0.653f, 0.737f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.GetStatistic("Wins").ToString(), 0.739f, 0.823f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.GetStatistic("Losses").ToString(), 0.825f, 0.909f, yMin);
+                    AddStatistic(container, UI_MENU, Configuration.Menu.Button.Get, userData.GetStatistic("Played").ToString(), 0.9111f, 0.995f, yMin);
+                    j++;
+                }
+            }
+        }
 
-            int i = 0;
-            foreach (var kit in ClassContents)
-            {
-                var color = UIColors["buttonbg"];
-                if (Kit == kit.Key)
-                    color = UIColors["buttongrey"];
-                if (currentClass == kit.Key)
-                    color = UIColors["buttonopen"];
-                CreateClassButton(ref MainCont, UIPanel, kit.Key, i, color);
-                i++;
+        #region Helpers
+        private void AddStatistic(CuiElementContainer container, string panel, string color, string message, float xMin, float xMax, float verticalPos, TextAnchor anchor = TextAnchor.MiddleCenter)
+        {            
+            UI.Panel(container, panel, color, new UI4(xMin, verticalPos, xMax, verticalPos + ELEMENT_HEIGHT));
+            UI.Label(container, panel, message, 12, new UI4(xMin + (anchor != TextAnchor.MiddleCenter ? 0.005f : 0f), verticalPos, xMax - (anchor != TextAnchor.MiddleCenter ? 0.005f : 0f), verticalPos + ELEMENT_HEIGHT), anchor);
+        }
 
-            }            
-            if (!string.IsNullOrEmpty(Kit))
+        private void AddLeaderSortButton(CuiElementContainer container, string panel, string color, string message, int page, EventStatistics.Statistic statistic, float xMin, float xMax, float verticalPos, TextAnchor anchor = TextAnchor.MiddleCenter)
+        {
+            UI4 ui4 = new UI4(xMin, verticalPos, xMax, verticalPos + ELEMENT_HEIGHT);
+
+            UI.Panel(container, panel, color, ui4);
+            UI.Label(container, panel, message, 12, new UI4(xMin + (anchor != TextAnchor.MiddleCenter ? 0.005f : 0f), verticalPos, xMax - (anchor != TextAnchor.MiddleCenter ? 0.005f : 0f), verticalPos + ELEMENT_HEIGHT), anchor);
+            UI.Button(container, panel, "0 0 0 0", string.Empty, 0, ui4, $"emui.statistics {(int)StatisticTab.Leaders} {(int)statistic} {page}");
+        }
+
+        private float GetHorizontalPos(int i, float start = 0.005f, float size = 0.1405f) => start + (size * i);
+
+        private float GetVerticalPos(int i, float start = 0.9f) => start - (i * (ELEMENT_HEIGHT + 0.005f));
+        #endregion
+        #endregion
+
+        #region Scoreboards        
+        public static CuiElementContainer CreateScoreboardBase(EventManager.BaseEventGame baseEventGame)
+        {
+            CuiElementContainer container = UI.Container(UI_SCORES, Configuration.Scoreboard.Background.Get, Configuration.Scoreboard.Position.UI4, false);
+
+            UI.Panel(container, UI_SCORES, Configuration.Scoreboard.Highlight.Get, UI4.Full);
+            UI.Label(container, UI_SCORES, $"{baseEventGame.Config.EventName} ({baseEventGame.Config.EventType})", 11, UI4.Full);
+
+            return container;            
+        }
+
+        public static void CreateScoreEntry(CuiElementContainer container, string text, string value1, string value2, int index)
+        {
+            float yMax = -(1f * index);
+            float yMin = -(1f * (index + 1));
+
+            UI.Panel(container, UI_SCORES, Configuration.Scoreboard.Panel.Get, new UI4(0f, yMin + 0.02f, 1f, yMax - 0.02f));
+
+            UI.Label(container, UI_SCORES, text, 11, new UI4(0.05f, yMin, 1f, yMax), TextAnchor.MiddleLeft);
+
+            if (!string.IsNullOrEmpty(value1))
             {
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color1}'{Kit}'</color> {msg("Kit Contents:", player)}", 19, "0.3 0.76", "0.7 0.84", TextAnchor.MiddleLeft);
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color2}{GetClassItems(Kit)}</color>", 17, "0.3 0.17", "0.7 0.75", TextAnchor.UpperLeft);
+                UI.Panel(container, UI_SCORES, Configuration.Scoreboard.Highlight.Get, new UI4(0.75f, yMin + 0.02f, 0.875f, yMax - 0.02f));
+                UI.Label(container, UI_SCORES, value1, 11, new UI4(0.75f, yMin, 0.875f, yMax), TextAnchor.MiddleCenter);
             }
 
-            if (!string.IsNullOrEmpty(Kit))            
-                EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonopen"], msg("Select", player), 18, "0.8 0.1", "0.93 0.17", $"EMI_ChangeClass {Kit}");            
-            else EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttongrey"], "---", 18, "0.8 0.1", "0.93 0.17", "");
-
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        public void DeathClassSelector(BasePlayer player)
-        {
-            string Kit = EventManager.GetUserClass(player) ?? string.Empty;
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, "0 0 0 0", "0 0", "1 0.92", true);
-            EventManager.UI.CreateOutLineLabel(ref MainCont, UIPanel, "0 0 0 1", msg("Switch Class", player), 18, "1.0 1.0", "0.01 0.92", "0.13 0.98");
-            EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], "X", 18, "0.125 0.935", "0.145 0.965", $"EMI_DeathChangeClass $close$");
-            int i = 0;
-            foreach (var kit in ClassContents)
+            if (!string.IsNullOrEmpty(value2))
             {
-                var color = UIColors["buttonbg"];
-                if (Kit == kit.Key)
-                    color = UIColors["buttonopen"];
-                CreateClassButton(ref MainCont, UIPanel, kit.Key, i, color, $"EMI_DeathChangeClass");
-                i++;
+                UI.Panel(container, UI_SCORES, Configuration.Scoreboard.Highlight.Get, new UI4(0.875f, yMin + 0.02f, 1f, yMax - 0.02f));
+                UI.Label(container, UI_SCORES, value2, 11, new UI4(0.875f, yMin, 1f, yMax), TextAnchor.MiddleCenter);
             }
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
         }
-        private void PopupMessage(BasePlayer player, string msg, bool useColor = true, int time = 3)
+
+        public static void CreatePanelEntry(CuiElementContainer container, string text, int index)
         {
-            if (PopupTimers.ContainsKey(player.userID) && PopupTimers[player.userID] != null)
-                PopupTimers[player.userID].Destroy();            
-             
-            var element = EventManager.UI.CreateElementContainer(UIPopup, UIColors["dark"], "0.25 0.85", "0.75 0.95");
-            EventManager.UI.CreatePanel(ref element, UIPopup, UIColors["buttonbg"], "0.005 0.04", "0.995 0.96");
-            if (useColor) msg = $"{Color1}{msg}</color>";
-            EventManager.UI.CreateLabel(ref element, UIPopup, "", msg, 18, "0 0", "1 1");            
+            float yMax = -(1f * index);
+            float yMin = -(1f * (index + 1));
 
-            CuiHelper.DestroyUi(player, UIPopup);
-            CuiHelper.AddUi(player, element);
+            UI.Panel(container, UI_SCORES, Configuration.Scoreboard.Foreground.Get, new UI4(0f, yMin + 0.02f, 1f, yMax - 0.02f));
 
-            if (!PopupTimers.ContainsKey(player.userID))
-              PopupTimers.Add(player.userID, timer.Once(time, () => CuiHelper.DestroyUi(player, UIPopup)));
-            else PopupTimers[player.userID] = timer.Once(time, () => CuiHelper.DestroyUi(player, UIPopup));
+            UI.Label(container, UI_SCORES, text, 11, new UI4(0.05f, yMin, 1f, yMax), TextAnchor.MiddleCenter);
+        }
+        #endregion
+
+        #region DeathScreen
+        private const string DEATH_SKULL_ICON = "emui.death_skullicon";
+        private const string DEATH_BACKGROUND = "emui.death_background";
+
+        private void RegisterDeathScreenImages()
+        {
+            if (!ImageLibrary)
+                return;
+
+            if (!string.IsNullOrEmpty(Configuration.DeathBackground))
+                AddImage(DEATH_BACKGROUND, Configuration.DeathBackground);
+
+            if (!string.IsNullOrEmpty(Configuration.DeathIcon))
+                AddImage(DEATH_SKULL_ICON, Configuration.DeathIcon);
         }
         
-        private void KitSelection(BasePlayer player, string command, bool isWeaponSet = false)
+        public static void DisplayDeathScreen(EventManager.BaseEventPlayer victim, string message, bool canRespawn)
         {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            object Kits;
-            if (isWeaponSet) Kits = GetWeaponSets();
-            else Kits = GetKits();
+            CuiElementContainer container = UI.Container(UI_DEATH, Configuration.Menu.Background.Get, UI4.Full, true);
 
-            int i = 1;
-            var nonePos = CalcPlayerNamePos(0);
-            var type = "kit";
-            var name = msg("kit", player);
-
-            if (isWeaponSet)
+            if (!string.IsNullOrEmpty(Configuration.DeathBackground))
             {
-                type = "ggconfig";
-                name = msg("weapon set", player);
+                string background = Instance.GetImage(DEATH_BACKGROUND);
+                if (!string.IsNullOrEmpty(background))
+                    UI.Image(container, UI_DEATH, background, UI4.Full);
             }
 
-            EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("None", player), 10, $"{nonePos[0]} {nonePos[1]}", $"{nonePos[2]} {nonePos[3]}", $"{command} {type} none");
-            if (Kits != null && Kits is string[])
-            {                
-                foreach (var kit in (string[])Kits)
-                {
-                    if (i > 84) break;
-                    var pos = CalcPlayerNamePos(i);
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], kit, 10, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"{command} {type} {kit}");
-                    i++;
-                }
-            }
-            if (i > 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", string.Format(msg("Select a {0}", player), name), 18, "0.2 0.92", "0.8 0.98");
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", string.Format(msg("Unable to find any {0}s", player), name), 18, "0.2 0.92", "0.8 0.98");
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void EventSelection(BasePlayer player, string command)
-        {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            var Games = EventManager.EventGames.Keys;
-            int i = 0;
-            if (Games != null && Games.Count > 0)
-            {                
-                foreach (var game in Games)
-                {
-                    if (i > 29) return;
-                    var pos = CalcPlayerNamePos(i);
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], game, 10, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"{command} type {game}");
-                    i++;
-                }                
-            }
-            if (i > 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Select a event type", player), 18, "0.2 0.92", "0.8 0.98");
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("There are no registered events", player), 18, "0.2 0.92", "0.8 0.98");
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void ZoneSelection(BasePlayer player, string command)
-        {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            var Zones = GetZones();
-            int i = 0;
-            if (Zones != null && Zones is string[])
-            {                
-                foreach (var zone in (string[])Zones)
-                {
-                    if (i > 85) return;
-                    var pos = CalcPlayerNamePos(i);
-                    var buttonString = zone;
-                    var zoneName = GetZoneName(zone);
-                    if (zoneName is string && !string.IsNullOrEmpty((string)zoneName))
-                        buttonString = (string)zoneName;
-
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], buttonString, 10, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"{command} zone {zone}");
-                    i++;
-                }
-            }
-            if (i > 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Select a zone", player), 18, "0.2 0.92", "0.8 0.98");
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Unable to find any zones", player), 18, "0.2 0.92", "0.8 0.98");
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void SpawnSelection(BasePlayer player, string command)
-        {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            var Spawns = GetSpawnfiles();
-            int i = 0;
-            if (Spawns != null && Spawns is string[])
+            if (!string.IsNullOrEmpty(Configuration.DeathIcon))
             {
-                foreach (var spawnfile in (string[])Spawns)
-                {
-                    if (i > 85) return;
-                    var pos = CalcPlayerNamePos(i);
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], spawnfile, 10, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"{command} {spawnfile}");
-                    i++;
-                } 
+                string icon = Instance.GetImage(DEATH_SKULL_ICON);
+                if (!string.IsNullOrEmpty(icon))
+                    UI.Image(container, UI_DEATH, icon, new UI4(0.45f, 0.405f, 0.55f, 0.595f));
             }
-            if (i > 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Select a spawn file", player), 18, "0.2 0.92", "0.8 0.98");
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Unable to find any spawn files", player), 18, "0.2 0.92", "0.8 0.98");
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void KickSelectionMenu(BasePlayer player, int page = 0)
-        {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            if (EventManager._Open || EventManager._Started)
-            {
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Select a player to kick", player), 18, "0.2 0.92", "0.8 0.98");
-                var players = EventManager.EventPlayers;
-                if (players.Count > 85)
-                {
-                    var maxpages = (players.Count - 1) / 85 + 1;
-                    if (page < maxpages - 1)
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Next", player), 18, "0.84 0.925", "0.97 0.98", $"EMI_ChangePage kick {page + 1}");
-                    if (page > 0)
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Back", player), 18, "0.03 0.925", "0.16 0.98", $"EMI_ChangePage kick {page - 1}");
-                }
-                int maxentries = (85 * (page + 1));
-                if (maxentries > players.Count)
-                    maxentries = players.Count;
-                int eventcount = 85 * page;
-
-                int i = 0;
-                for (int n = eventcount; n < maxentries; n++)
-                {
-                    var p = players[n];
-                    if (p == null) continue;
-                    if (!EventManager.isPlaying(p.GetPlayer()))
-                    {
-                        var pos = CalcPlayerNamePos(i);
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], p.GetPlayer().displayName, 10, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"EMI_KickPlayer {p.GetPlayer().UserIDString}");
-                        i++;
-                    }
-                }
-            }
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("There is no event in progress", player), 18, "0.2 0.92", "0.8 0.98");
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void JoinSelectionMenu(BasePlayer player, int page = 0)
-        {   
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            if (EventManager._Open || EventManager._Started)
-            {
-                EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Select a player to force join the event", player), 18, "0.2 0.92", "0.8 0.98");
-                var players = BasePlayer.activePlayerList;
-                if (players.Count > 85)
-                {
-                    var maxpages = (players.Count - 1) / 85 + 1;
-                    if (page < maxpages - 1)
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Next", player), 18, "0.84 0.925", "0.97 0.98", $"EMI_ChangePage join {page + 1}");
-                    if (page > 0)
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Back", player), 18, "0.03 0.925", "0.16 0.98", $"EMI_ChangePage join {page - 1}");
-                }
-                int maxentries = (85 * (page + 1));
-                if (maxentries > players.Count)
-                    maxentries = players.Count;
-                int eventcount = 85 * page;
-
-                int i = 0;
-                for (int n = eventcount; n < maxentries; n++)
-                {
-                    var p = players[n];
-                    if (p == null) continue;
-                    if (!EventManager.isPlaying(p))
-                    {
-                        var pos = CalcPlayerNamePos(i);
-                        EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], p.displayName, 10, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"EMI_JoinPlayer {p.UserIDString}");
-                        i++;
-                    }
-                }               
-            }
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("There is no event in progress", player), 18, "0.2 0.92", "0.8 0.98");
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        private void SwitchConfig(BasePlayer player, int page = 0)
-        {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);            
-            if (Event_Config.Event_List.Count > 9)
-            {
-                var maxpages = (Event_Config.Event_List.Count - 1) / 9 + 1;
-                if (page < maxpages - 1)
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Next", player), 18, "0.84 0.925", "0.97 0.98", $"EMI_ChangePage config {page + 1}");
-                if (page > 0)
-                    EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], msg("Back", player), 18, "0.03 0.925", "0.16 0.98", $"EMI_ChangePage config {page - 1}");
-            }
-            int maxentries = (9 * (page + 1));
-            if (maxentries > Event_Config.Event_List.Count)
-                maxentries = Event_Config.Event_List.Count;
-            int eventcount = 9 * page;
-
-            if (Event_Config.Event_List.Count > 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Select a event config from your list of preconfigured events", player), 18, "0.2 0.92", "0.8 0.98");
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("You do not have any saved event configs", player), 18, "0.2 0.92", "0.8 0.98");
-
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-
-            var EventNames = new List<string>();
-            foreach (var entry in Event_Config.Event_List)
-                EventNames.Add(entry.Key);
-            int i = 0;
-            for (int n = eventcount; n < maxentries; n++)
-            {
-                if (EventManager.EventGames.ContainsKey(Event_Config.Event_List[EventNames[n]].EventType))
-                {
-                    if (EventManager._CurrentEventConfig == EventNames[n])
-                        CreateEventEntry(player, EventNames[n], Event_Config.Event_List[EventNames[n]], $"", $"{Color1}{msg("Selected", player)}</color>", i);
-                    else CreateEventEntry(player, EventNames[n], Event_Config.Event_List[EventNames[n]], $"EMI_SelectConfig {EventNames[n]}", "Select", i);
-                    i++;
-                }
-            }
-        }
-        private void NextAutoConfig(BasePlayer player)
-        {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
             
-            int i = 0;
-            foreach (var entry in EventManager.ValidAutoEvents)
-            {
-                if (i > 29) return;
-                var pos = CalcEntryPos(i);
-                var config = Event_Config.Event_List[entry.EventConfig];
-                if (config == null) continue;
-                EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], string.Format(msg("   Config: {0}\n   Type: {1}\n   Spawns: {2}   {3}\n   Kit: {4}{5}\n   Zone: {6}", player), entry.EventConfig, config.EventType, config.Spawnfile, config.Spawnfile2, config.Kit, config.WeaponSet, config.ZoneID), 11, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"EMI_NextAutoConfig {i} {entry.EventConfig}", TextAnchor.MiddleLeft);
-                i++;
+            UI.Label(container, UI_DEATH, message, 22, new UI4(0.2f, 0.7f, 0.8f, 0.85f));
 
-            }
-            if (i == 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("You do not have any saved auto event configs", player), 18, "0.2 0.92", "0.8 0.98");
-            else EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{msg("Currently Selected Config:", player)} {Color1}{EventManager._CurrentEventConfig ?? "None"}</color>", 18, "0.2 0.92", "0.8 0.98");
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
+            victim.DestroyUI(UI_DEATH);
+            victim.AddUI(UI_DEATH, container);
+
+            if (canRespawn)
+                UpdateRespawnButton(victim);
+            else CreateLeaveButton(victim);
         }
-        private void NewAutoConfig(BasePlayer player)
+        
+        public static void UpdateRespawnButton(EventManager.BaseEventPlayer eventPlayer)
         {
-            var MainCont = EventManager.UI.CreateElementContainer(UIPanel, UIColors["dark"], "0 0", "0.88 0.92");
-            EventManager.UI.CreatePanel(ref MainCont, UIPanel, UIColors["light"], "0.011 0.01", "0.99 0.99", true);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("Select a event config to use for the auto-event", player), 18, "0.2 0.92", "0.8 0.98");
-            int i = 0;
-            foreach (var entry in Event_Config.Event_List)
+            CuiElementContainer container = UI.Container(UI_RESPAWN, Configuration.Menu.Panel.Get, new UI4(0f, 0f, 1f, 0.04f), true);
+
+            UI.Panel(container, UI_RESPAWN, Configuration.Menu.Highlight.Get, new UI4(0f, 1f, 1f, 1.005f));
+
+            UI.Button(container, UI_RESPAWN, eventPlayer.CanRespawn ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, eventPlayer.CanRespawn ? Message("UI.Death.Respawn", eventPlayer.Player.userID) : string.Format(Message("UI.Death.Respawn.Time", eventPlayer.Player.userID), eventPlayer.RespawnRemaining), 13, new UI4(0.005f, 0.125f, 0.1f, 0.875f), "emui.respawn");
+
+            UI.Label(container, UI_RESPAWN, Message("UI.Death.AutoRespawn", eventPlayer.Player.userID), 13, new UI4(0.1f, 0.125f, 0.17f, 0.875f), TextAnchor.MiddleRight);
+            UI.Toggle(container, UI_RESPAWN, Configuration.Menu.Button.Get, 14, new UI4(0.18f, 0.125f, 0.2f, 0.875f), "emui.toggleautospawn", eventPlayer.AutoRespawn);
+
+            List<string> kits = EventManager.BaseManager.GetAvailableKits(eventPlayer.Team);
+
+            if (EventManager.BaseManager.Config.AllowClassSelection && kits.Count > 1)
             {
-                if (i > 29) return;
-                var pos = CalcEntryPos(i);
-                EventManager.UI.CreateButton(ref MainCont, UIPanel, UIColors["buttonbg"], string.Format(msg("   Config: {0}\n   Type: {1}\n   Spawns: {2}   {3}\n   Kit: {4}{5}\n   Zone: {6}", player), entry.Key, entry.Value.EventType, entry.Value.Spawnfile, entry.Value.Spawnfile2, entry.Value.Kit, entry.Value.WeaponSet, entry.Value.ZoneID), 11, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"EMI_NewAutoConfig newconf {entry.Key}", TextAnchor.MiddleLeft);
-                i++;
+                UI.Button(container, UI_RESPAWN, eventPlayer.IsSelectingClass ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Death.Class", eventPlayer.Player.userID), 13, new UI4(0.895f, 0.125f, 0.995f, 0.875f), $"emui.selectkit {CommandSafe(eventPlayer.Kit)} {!eventPlayer.IsSelectingClass}");
 
-            }
-            if (i == 0) EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", msg("You do not have any saved event configs", player), 18, "0.2 0.92", "0.8 0.98");            
-            CuiHelper.DestroyUi(player, UIPanel);
-            CuiHelper.AddUi(player, MainCont);
-        }
-        #endregion
+                if (eventPlayer.IsSelectingClass)
+                {
+                    UI.Panel(container, UI_RESPAWN, Configuration.Menu.Panel.Get, new UI4(0.89f, 1f, 1f, 1f + kits.Count));
 
-        #region UI Creation
-        private void CreateEventEntry(BasePlayer player, string name, EventManager.Events entry, string buttonCommand, string buttonText, int num, float dimH = 0.28f, float dimV = 0.263f)
-        {
-            if (!UIEntries.ContainsKey(player.userID))
-                UIEntries.Add(player.userID, new List<string>());            
-            Vector2 dimensions = new Vector2(dimH, dimV);
-            Vector2 posMin = CalcEventEntryPos(num, dimensions);
-            Vector2 posMax = posMin + dimensions;
-            var panelname = UIEntries + num.ToString();
-            var eventEntry = EventManager.UI.CreateElementContainer(panelname, "0 0 0 0", $"{posMin.x} {posMin.y}", $"{posMax.x} {posMax.y}");
-            EventManager.UI.CreatePanel(ref eventEntry, panelname, UIColors["buttonbg"], $"0 0", $"1 1");
+                    UI.Panel(container, UI_RESPAWN, Configuration.Menu.Highlight.Get, new UI4(0.88975f, 1f, 0.89f, 1f + kits.Count + 0.005f)); // Side highlight
 
-            EventManager.UI.CreateButton(ref eventEntry, panelname, UIColors["buttonbg"], buttonText, 18, $"0.75 0.83", $"0.97 0.97", $"{buttonCommand} {name}");
-            int i = 0;
-            AddInfoEntry(ref eventEntry, panelname, msg("Event Type", player), entry.EventType, i, 0.65f, 0.795f, 0.145f, 0.05f, 0.5f, 1, 16); i++;
-            if (entry.EventType == "GunGame")
-            { AddInfoEntry(ref eventEntry, panelname, msg("Weapon Set", player), entry.WeaponSet, i, 0.65f, 0.795f, 0.145f, 0.05f, 0.5f, 1, 16); i++; }
-            else { AddInfoEntry(ref eventEntry, panelname, msg("Kit", player), entry.Kit, i, 0.65f, 0.795f, 0.145f, 0.05f, 0.5f, 1, 16); i++; }
-            AddInfoEntry(ref eventEntry, panelname, msg("Spawnfile", player), $"{entry.Spawnfile}  {entry.Spawnfile2}", i, 0.65f, 0.795f, 0.145f, 0.05f, 0.5f, 1, 16); i++;
-            AddInfoEntry(ref eventEntry, panelname, msg("Zone ID", player), entry.ZoneID, i, 0.65f, 0.795f, 0.145f, 0.05f, 0.5f, 1, 16); i++;
-            AddInfoEntry(ref eventEntry, panelname, msg("Class Selector", player), entry.UseClassSelector.ToString(), i, 0.65f, 0.795f, 0.145f, 0.05f, 0.5f, 1, 16);
+                    UI.Panel(container, UI_RESPAWN, Configuration.Menu.Highlight.Get, new UI4(0.89f, 1f + kits.Count, 1f, 1f + kits.Count + 0.005f)); // Top highlight
 
-            EventManager.UI.CreateLabel(ref eventEntry, panelname, "", name, 22, $"0.05 0.83", "0.7 0.98", TextAnchor.MiddleLeft);
-            UIEntries[player.userID].Add(panelname);
-            CuiHelper.AddUi(player, eventEntry);
-        }
-        private void CreateMenuButton(ref CuiElementContainer container, string panelName, string buttonname, string command, int number)
-        {
-            Vector2 dimensions = new Vector2(0.1f, 0.6f);
-            Vector2 origin = new Vector2(0.25f, 0.2f);
-            Vector2 offset = new Vector2((0.01f + dimensions.x) * number, 0);
+                    for (int i = 0; i < kits.Count; i++)
+                    {
+                        string kit = kits[i];                        
 
-            Vector2 posMin = origin + offset;
-            Vector2 posMax = posMin + dimensions;
-
-            EventManager.UI.CreateButton(ref container, panelName, UIColors["buttonbg"], buttonname, 18, $"{posMin.x} {posMin.y}", $"{posMax.x} {posMax.y}", command);
-        }
-        private void CreateAdminButton(ref CuiElementContainer container, string panelName, string buttonname, string command, int number)
-        {
-            Vector2 dimensions = new Vector2(0.8f, 0.05f);
-            Vector2 origin = new Vector2(0.055f, 0.9f);
-            Vector2 offset = new Vector2(0, (0.01f + dimensions.y) * number);
-
-            Vector2 posMin = origin - offset;
-            Vector2 posMax = posMin + dimensions;
-
-            EventManager.UI.CreateButton(ref container, panelName, UIColors["buttonbg"], buttonname, 18, $"{posMin.x} {posMin.y}", $"{posMax.x} {posMax.y}", command);
-        }
-        private void CreateControlButton(ref CuiElementContainer container, string panelName, string buttonname, string command, float minY, int number)
-        {
-            Vector2 dimensions = new Vector2(0.095f, 0.04f);
-            Vector2 origin = new Vector2(0.5f, minY + 0.005f);
-            Vector2 offset = new Vector2((0.005f + dimensions.x) * number, 0);
-
-            Vector2 posMin = origin + offset;
-            Vector2 posMax = posMin + dimensions;
-
-            EventManager.UI.CreateButton(ref container, panelName, UIColors["buttonbg"], buttonname, 17, $"{posMin.x} {posMin.y}", $"{posMax.x} {posMax.y}", command);
-        }
-        private void CreateControlButtonSmall(ref CuiElementContainer container, string panelName, string buttonname, string command, float minY, int number)
-        {
-            Vector2 dimensions = new Vector2(0.095f, 0.05f);
-            Vector2 origin = new Vector2(0.25f, minY + 0.005f);
-            Vector2 offset = new Vector2((0.005f + dimensions.x) * number, 0);
-
-            Vector2 posMin = origin + offset;
-            Vector2 posMax = posMin + dimensions;
-
-            EventManager.UI.CreateButton(ref container, panelName, UIColors["buttonbg"], buttonname, 14, $"{posMin.x} {posMin.y}", $"{posMax.x} {posMax.y}", command);
-        }
-        private void CreateClassButton(ref CuiElementContainer container, string panelName, string kit, int number, string color, string command = "EMI_ClassDescription")
-        {
-            Vector2 dimensions = new Vector2(0.13f, 0.05f);
-            Vector2 origin = new Vector2(0.015f, 0.85f);
-            float offsetY = (0.005f + dimensions.y) * number;            
-            Vector2 offset = new Vector2(0, offsetY);
-
-            Vector2 posMin = origin - offset;
-            Vector2 posMax = posMin + dimensions;           
-
-            EventManager.UI.CreateButton(ref container, panelName, color, kit, 16, posMin.x + " " + posMin.y, posMax.x + " " + posMax.y, $"{command} {kit}");
-        }
-        private void CreateClassEditorButton(ref CuiElementContainer container, string panelName, string name, int number, bool kit)
-        {
-            float posX = 0.076f;
-            string command = $"EMI_AddClass {name}";
-            if (!kit)
-            {
-                posX = 0.815f;
-                command = $"EMI_RemoveClass {name}";
-            }
-            Vector2 dimensions = new Vector2(0.12f, 0.041f);
-            Vector2 origin = new Vector2(posX, 0.795f);
-            float offsetY = 0;
-            float offsetX = 0;
-
-            if (number >= 0 && number < 16)
-            {
-                offsetY = (0.0075f + dimensions.y) * number;
-            }
-            if (number > 15 && number < 32)
-            {
-                offsetY = (0.0075f + dimensions.y) * (number - 16);
-                offsetX = (0.01f + dimensions.x) * 1;
-            }
-            if (number > 31 && number < 48)
-            {
-                offsetY = (0.0075f + dimensions.y) * (number - 32);
-                offsetX = (0.01f + dimensions.x) * 2;
-            }
-            if (number > 47 && number < 64)
-            {
-                offsetY = (0.0075f + dimensions.y) * (number - 48);
-                offsetX = (0.01f + dimensions.x) * 3;
-            }
-            if (number > 63 && number < 80)
-            {
-                offsetY = (0.0075f + dimensions.y) * (number - 64);
-                offsetX = (0.01f + dimensions.x) * 4;
-            }
-
-            Vector2 posMin = new Vector2(origin.x + offsetX, origin.y - offsetY);
-            Vector2 posMax = posMin + dimensions;
-
-            EventManager.UI.CreateButton(ref container, panelName, UIColors["buttonbg"], name, 14, posMin.x + " " + posMin.y, posMax.x + " " + posMax.y, command);
-        }
-        private void CreateAutoEventEditorButton(ref CuiElementContainer container, string panelName, AEConfig config, int number, int confnum)
-        {            
-            Vector2 dimensions = new Vector2(0.1f, 0.05f);
-            Vector2 origin = new Vector2(0.46f, 0.785f);
-            float offsetY = (0.01f + dimensions.y) * number; 
-
-            Vector2 posMin = new Vector2(origin.x, origin.y - offsetY);
-            Vector2 posMax = posMin + dimensions;
-            EventManager.UI.CreateLabel(ref container, panelName, "", $"{msg("Config:")} {Color1}{config.EventConfig}</color>", 14, $"{posMin.x} {posMin.y}", $"{posMin.x + 0.11f} {posMax.y}");
-            EventManager.UI.CreateLabel(ref container, panelName, "", $"{msg("Join Time:")} {Color1}{config.TimeToJoin}</color>", 14, $"{posMin.x + 0.11f} {posMin.y}", $"{posMin.x + 0.21f} {posMax.y}");
-            EventManager.UI.CreateLabel(ref container, panelName, "", $"{msg("Start Time:")} {Color1}{config.TimeToStart}</color>", 14, $"{posMin.x + 0.21f} {posMin.y}", $"{posMin.x + 0.31f} {posMax.y}");
-            EventManager.UI.CreateLabel(ref container, panelName, "", $"{msg("Time Limit:")} {Color1}{config.TimeLimit}</color>", 14, $"{posMin.x + 0.31f} {posMin.y}", $"{posMin.x + 0.41f} {posMax.y}");
-            EventManager.UI.CreateButton(ref container, panelName, UIColors["buttonbg"], msg("Remove"), 14, $"{posMin.x + 0.41f} {posMin.y}", $"{posMin.x + 0.51f} {posMax.y}", $"EMI_RemoveAutoEvent {confnum}");
-        }
-        private void AddInfoEntry(ref CuiElementContainer MainCont, string UIPanel, string key, string value, int num, float posMiny = 0.88f, float posMaxy = 0.94f, float spacing = 0.05f, float xMin = 0.05f, float xMid = 0.3f, float xMax = 0.5f, int fontSize = 18)
-        {            
-            if (num > 0)
-            {
-                posMiny = posMiny - (spacing * num);
-                posMaxy = posMaxy - (spacing * num);
-            }
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{key}  :", fontSize, $"{xMin} {posMiny}", $"{xMid} {posMaxy}", TextAnchor.MiddleLeft);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color1}{value}</color>", fontSize, $"{xMid} {posMiny}", $"{xMax} {posMaxy}", TextAnchor.MiddleLeft);
-        }        
-        private void AddLBEntry(ref CuiElementContainer MainCont, string UIPanel, string playername, string kd, string wins, string rank, int num)
-        {
-            var posMin = 0.86f;
-            var posMax = 0.92f;
-            if (num > 0)
-            {
-                posMin = posMin - (0.03f * num);
-                posMax = posMax - (0.03f * num);
-            }
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color1}{playername}</color>", 16, $"0.525 {posMin}", $"0.775 {posMax}", TextAnchor.MiddleCenter);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color1}{rank}</color>", 16, $"0.775 {posMin}", $"0.825 {posMax}", TextAnchor.MiddleCenter);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color1}{kd}</color>", 16, $"0.825 {posMin}", $"0.9 {posMax}", TextAnchor.MiddleCenter);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color1}{wins}</color>", 16, $"0.9 {posMin}", $"0.95 {posMax}", TextAnchor.MiddleCenter);            
-        }
-        private void AddInfoAuto(ref CuiElementContainer MainCont, string UIPanel, string key, string value, int num)
-        {
-            var posMin = 0.88f;
-            var posMax = 0.95f;
-            if (num > 0)
-            {
-                posMin = posMin - (0.06f * num);
-                posMax = posMax - (0.06f * num);
-            }
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{key}  :", 16, $"0.02 {posMin}", $"0.175 {posMax}", TextAnchor.MiddleLeft);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color1}{value}</color>", 16, $"0.175 {posMin}", $"0.25 {posMax}", TextAnchor.MiddleLeft);
-        }
-        private void GetEventInfo(ref CuiElementContainer container, string panel, float xPos = 0.05f, float yPos = 0.72f, int fontSize = 18)
-        {
-            int i = 0;
-            AddInfoEntry(ref container, panel, msg("Event Type"), EventManager._Event.EventType, i, yPos, yPos + 0.06f, 0.03f, xPos, xPos + 0.2f, xPos + 0.5f, fontSize); i++;            
-            AddInfoEntry(ref container, panel, msg("Players"), GetPlayerCount(), i, yPos, yPos + 0.06f, 0.03f, xPos, xPos + 0.2f, xPos + 0.5f, fontSize); i++;
-            if (EventManager.EventGames[EventManager._Event.EventType].RequiresKit && !EventManager._Event.UseClassSelector)
-            { AddInfoEntry(ref container, panel, msg("Kit"), EventManager._Event.Kit, i, yPos, yPos + 0.06f, 0.03f, xPos, xPos + 0.2f, xPos + 0.5f, fontSize); i++; }
-            if (EventManager._Event.EventType == "GunGame")
-            { AddInfoEntry(ref container, panel, msg("Weapon Set"), EventManager._Event.WeaponSet, i, yPos, yPos + 0.06f, 0.03f, xPos, xPos + 0.2f, xPos + 0.5f, fontSize); i++; }
-            if (EventManager._Event.UseClassSelector)
-            { AddInfoEntry(ref container, panel, msg("Class Selector"), EventManager._Event.UseClassSelector.ToString(), i, yPos, yPos + 0.06f, 0.03f, xPos, xPos + 0.2f, xPos + 0.5f, fontSize); i++; }
-
-        }
-        private void GetGameScores(ref CuiElementContainer container, string panel, float xPos = 0.6f, float yPos = 0.72f, int fontSize = 18)
-        {
-            var scores = EventManager.GameScores;
-            if (scores != null && scores.Scores.Count > 0)
-            {
-                int i = 2;
-                AddInfoEntry(ref container, panel, msg("Leaders"), msg("Score"), 0, yPos, yPos + 0.06f, 0.03f, xPos, xPos + 0.2f, xPos + 0.35f, fontSize);
-                foreach (var score in scores.Scores.Take(20))
-                {                    
-                    AddInfoEntry(ref container, panel, score.Value.Name, score.Value.Score.ToString(), i, yPos, yPos + 0.06f, 0.03f, xPos, xPos + 0.2f, xPos + 0.35f, fontSize);
-                    i++;
+                        UI.Button(container, UI_RESPAWN, eventPlayer.Kit.Equals(kit, StringComparison.OrdinalIgnoreCase) ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, kit, 12, new UI4(0.895f, (1f + i) + 0.125f, 0.995f, (1f + (i + 1f)) - 0.125f), $"emui.selectkit {CommandSafe(kit)} true");
+                    }
                 }
             }
-        }
-        private string GetEventStatus()
-        {
-            string status;
-            if (EventManager._Open) status = msg("Open");
-            else status = msg("Closed");
-            if (EventManager._Started) status += msg(" - Started");
-            else if (EventManager._Open) status += msg(" - Pending");
-            else status += msg(" - Finished");
-            return status;
-        }
-        private string GetAutoEventStatus()
-        {
-            if (EventManager._Launched) return msg("Launched");
-            else return msg("Disabled");
-        }
-        private string GetPlayerCount()
-        {
-            int count;
-            string maxCount;
-            var max = EventManager._Event.MaximumPlayers;
 
-            if (EventManager._Open)
-            {
-                if (!EventManager._Started)
-                    count = EventManager.Joiners.Count;
-                else count = EventManager.EventPlayers.Count;
-            }
-            else count = 0;
+            eventPlayer.DestroyUI(UI_RESPAWN);
+            eventPlayer.AddUI(UI_RESPAWN, container);
+        }
 
-            if (max < 1) maxCount = "~";
-            else maxCount = max.ToString();
-            return $"{count} / {maxCount}";
-        }
-        private Vector2 CalcEventEntryPos(int number, Vector2 dimensions)
+        public static void CreateLeaveButton(EventManager.BaseEventPlayer eventPlayer)
         {
-            Vector2 position = new Vector2(0.015f, 0.56f);
-            float offsetY = 0;
-            float offsetX = 0;
-            if (number >= 0 && number < 3)
-            {
-                offsetX = (0.005f + dimensions.x) * number;
-            }
-            if (number > 2 && number < 6)
-            {
-                offsetX = (0.005f + dimensions.x) * (number - 3);
-                offsetY = (-0.005f - dimensions.y) * 1;
-            }
-            if (number > 5 && number < 9)
-            {
-                offsetX = (0.005f + dimensions.x) * (number - 6);
-                offsetY = (-0.005f - dimensions.y) * 2;
-            }            
-            return position + new Vector2(offsetX, offsetY);
-        }
-        private float[] CalcEntryPos(int number)
-        {
-            Vector2 position = new Vector2(0.019f, 0.8f);
-            Vector2 dimensions = new Vector2(0.19f, 0.12f);
-            float offsetY = 0;
-            float offsetX = 0;
-            if (number >= 0 && number < 5)
-            {
-                offsetX = (0.002f + dimensions.x) * number;
-            }
-            if (number > 4 && number < 10)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 5);
-                offsetY = (-0.0055f - dimensions.y) * 1;
-            }
-            if (number > 9 && number < 15)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 10);
-                offsetY = (-0.0055f - dimensions.y) * 2;
-            }
-            if (number > 14 && number < 20)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 15);
-                offsetY = (-0.0055f - dimensions.y) * 3;
-            }
-            if (number > 19 && number < 25)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 20);
-                offsetY = (-0.0055f - dimensions.y) * 4;
-            }
-            if (number > 24 && number < 30)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 25);
-                offsetY = (-0.0055f - dimensions.y) * 5;
-            }
+            CuiElementContainer container = UI.Container(UI_RESPAWN, Configuration.Menu.Panel.Get, new UI4(0f, 0f, 1f, 0.04f), true);
 
-            Vector2 offset = new Vector2(offsetX, offsetY);
-            Vector2 posMin = position + offset;
-            Vector2 posMax = posMin + dimensions;
-            return new float[] { posMin.x, posMin.y, posMax.x, posMax.y };
+            UI.Panel(container, UI_RESPAWN, Configuration.Menu.Highlight.Get, new UI4(0f, 1f, 1f, 1.005f));
+
+            UI.Button(container, UI_RESPAWN, eventPlayer.CanRespawn ? Configuration.Menu.Highlight.Get : Configuration.Menu.Button.Get, Message("UI.Death.Leave", eventPlayer.Player.userID), 13, new UI4(0.005f, 0.125f, 0.1f, 0.875f), "emui.leaveevent");
+                        
+            eventPlayer.DestroyUI(UI_RESPAWN);
+            eventPlayer.AddUI(UI_RESPAWN, container);
         }
-        private float[] CalcPlayerNamePos(int number)
-        {
-            Vector2 position = new Vector2(0.0145f, 0.82f);
-            Vector2 dimensions = new Vector2(0.137f, 0.06f);
-            float offsetY = 0;
-            float offsetX = 0;
-            if (number >= 0 && number < 7)
-            {
-                offsetX = (0.002f + dimensions.x) * number;
-            }
-            if (number > 6 && number < 14)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 7);
-                offsetY = (-0.0055f - dimensions.y) * 1;
-            }
-            if (number > 13 && number < 21)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 14);
-                offsetY = (-0.0055f - dimensions.y) * 2;
-            }
-            if (number > 20 && number < 28)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 21);
-                offsetY = (-0.0055f - dimensions.y) * 3;
-            }
-            if (number > 27 && number < 35)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 28);
-                offsetY = (-0.0055f - dimensions.y) * 4;
-            }
-            if (number > 34 && number < 42)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 35);
-                offsetY = (-0.0055f - dimensions.y) * 5;
-            }
-            if (number > 41 && number < 49)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 42);
-                offsetY = (-0.0055f - dimensions.y) * 6;
-            }
-            if (number > 48 && number < 56)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 49);
-                offsetY = (-0.0055f - dimensions.y) * 7;
-            }
-            if (number > 55 && number < 63)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 56);
-                offsetY = (-0.0055f - dimensions.y) * 8;
-            }
-            if (number > 62 && number < 70)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 63);
-                offsetY = (-0.0055f - dimensions.y) * 9;
-            }
-            if (number > 69 && number < 77)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 70);
-                offsetY = (-0.0055f - dimensions.y) * 10;
-            }
-            if (number > 76 && number < 85)
-            {
-                offsetX = (0.002f + dimensions.x) * (number - 77);
-                offsetY = (-0.0055f - dimensions.y) * 11;
-            }
-            Vector2 offset = new Vector2(offsetX, offsetY);
-            Vector2 posMin = position + offset;
-            Vector2 posMax = posMin + dimensions;
-            return new float[] { posMin.x, posMin.y, posMax.x, posMax.y };
-        }
-        private string GetClassItems(string kit)
-        {
-            if (ClassContents.ContainsKey(kit))
-                return ClassContents[kit];                
-            return "";
-        }
-        #region Colors
-        private void SetUIColors()
-        {
-            UIColors.Add("dark", EventManager.UI.Color(configData.Colors.Background_Dark.Color, configData.Colors.Background_Dark.Alpha));
-            UIColors.Add("medium", EventManager.UI.Color(configData.Colors.Background_Medium.Color, configData.Colors.Background_Medium.Alpha));
-            UIColors.Add("light", EventManager.UI.Color(configData.Colors.Background_Light.Color, configData.Colors.Background_Light.Alpha));
-            UIColors.Add("buttonbg", EventManager.UI.Color(configData.Colors.Button_Standard.Color, configData.Colors.Button_Standard.Alpha));
-            UIColors.Add("buttonopen", EventManager.UI.Color(configData.Colors.Button_Accept.Color, configData.Colors.Button_Accept.Alpha));
-            UIColors.Add("buttongrey", EventManager.UI.Color(configData.Colors.Button_Inactive.Color, configData.Colors.Button_Inactive.Alpha));
-        }        
         #endregion
+
+        #region ImageLibrary
+        internal void AddImage(string imageName, string url) => ImageLibrary.Call("AddImage", url, imageName);
+
+        internal string GetImage(string name) => (string)ImageLibrary.Call("GetImage", name);
+        #endregion
+
+        #region UI Args
+        public struct MenuArgs
+        {
+            public int Page;
+            public MenuTab Menu;
+            public AdminTab Admin;
+            public StatisticTab Statistic;
+            public EventStatistics.Statistic StatisticSort;
+            public SelectorArgs Selector;
+
+            public MenuArgs(MenuTab menu)
+            {
+                Page = 0;
+                Menu = menu;
+                Statistic = StatisticTab.Global;
+                Admin = AdminTab.None;
+                StatisticSort = EventStatistics.Statistic.Rank;
+                Selector = default(SelectorArgs);
+            }
+
+            public MenuArgs(int page, MenuTab menu)
+            {
+                Page = page;
+                Menu = menu;
+                Statistic = StatisticTab.Personal;
+                Admin = AdminTab.None;
+                StatisticSort = EventStatistics.Statistic.Rank;
+                Selector = default(SelectorArgs);
+            }
+
+            public MenuArgs(AdminTab admin)
+            {
+                Page = 0;
+                Menu = MenuTab.Admin;
+                Statistic = StatisticTab.Personal;
+                Admin = admin;
+                StatisticSort = EventStatistics.Statistic.Rank;
+                Selector = default(SelectorArgs);
+            }
+
+            public MenuArgs(StatisticTab statistic, EventStatistics.Statistic sort, int page)
+            {
+                Page = page;
+                Menu = MenuTab.Statistics;
+                Statistic = statistic;
+                Admin = AdminTab.None;
+                StatisticSort = sort;
+                Selector = default(SelectorArgs);
+            }
+
+            public MenuArgs(SelectorArgs selectorArgs, int page)
+            {
+                Page = page;
+                Selector = selectorArgs;
+                Menu = MenuTab.Admin;
+                Admin = AdminTab.Selector;
+                Statistic = StatisticTab.Personal;
+                StatisticSort = EventStatistics.Statistic.Rank;
+            }
+
+            public MenuArgs(SelectorArgs selectorArgs, AdminTab admin, int page)
+            {
+                Page = page;
+                Selector = selectorArgs;
+                Menu = MenuTab.Admin;
+                Admin = admin;
+                Statistic = StatisticTab.Personal;
+                StatisticSort = EventStatistics.Statistic.Rank;
+            }
+        }
+
+        public struct SelectorArgs
+        {
+            public string Title;
+            public string FieldName;
+            public string Hook;
+            public bool AllowMultiple;
+
+            public SelectionType Type;
+            public string Callback;
+
+            public SelectorArgs(string title, string fieldName, string hook, bool allowMultiple, SelectionType type = SelectionType.Field)
+            {
+                Title = title;
+                FieldName = fieldName;
+                Hook = hook;
+                AllowMultiple = allowMultiple;
+                Type = SelectionType.Field;
+                Callback = string.Empty;
+            }
+
+            public SelectorArgs(string title, SelectionType type, string callback)
+            {
+                Title = title;
+                FieldName = string.Empty;
+                Hook = string.Empty;
+                AllowMultiple = false;
+                Type = type;
+                Callback = callback;
+            }
+        }
+
         #endregion
 
         #region UI Commands
-        [ConsoleCommand("EMI_ChangeElement")]
-        private void ccmdChangeElement(ConsoleSystem.Arg arg)
+        #region Creator Commands
+        [ConsoleCommand("emui.create")]
+        private void ccmdCreateEvent(ConsoleSystem.Arg arg)
         {
-            var player = arg.Connection.player as BasePlayer;
+            BasePlayer player = arg.Player();
             if (player == null)
                 return;
-            DestroyEntries(player);
-            switch (arg.Args[0].ToLower())
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                case "home":
-                    CuiHelper.DestroyUi(player, UIAdmin);
-                    CreateHome(player);
-                    return;
-                case "voting":
-                    CuiHelper.DestroyUi(player, UIAdmin);
-                    CreateVoting(player);
-                    return;
-                case "stats":
-                    CuiHelper.DestroyUi(player, UIAdmin);
-                    CreateStatistics(player);
-                    return;
-                case "selectclass":
-                    {
-                        if (EventManager.isPlaying(player))
-                            ClassSelector(player, player.GetComponent<EventManager.EventPlayer>().currentClass);
-                        else ClassSelector(player);  
-                    }
-                    return;
-                case "admin":
-                    if (HasPerm(player))
-                        CreateAdminMenu(player);                    
-                    return;
-                case "auto":
-                    if (HasPerm(player))
-                        EventAutoEvent(player);
-                    return;
-                case "class":
-                    if (HasPerm(player))
-                        EventClasses(player);
-                    return;
-                case "control":
-                    if (HasPerm(player))
-                        EventControl(player);
-                    return;
-                case "events":
-                    if (HasPerm(player))
-                        EventRemover(player); return;
-                case "createevent":
-                    if (HasPerm(player))
-                    {
-                        if (!EventCreators.ContainsKey(player.userID))
-                            EventCreators.Add(player.userID, new EventManager.Events());
-                        else EventCreators[player.userID] = new EventManager.Events();
-                        EventCreator(player);
-                    }
-                    return;                
-                case "kick":
-                    if (HasPerm(player))
-                        KickSelectionMenu(player);
-                    return;
-                case "join":
-                    if (HasPerm(player))
-                        JoinSelectionMenu(player);
-                    return;
-                default:
-                    break;
-            }
-        }
-        [ConsoleCommand("EMI_ChangePage")]
-        private void ccmdChangePage(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            DestroyEntries(player);
-            
-            var type = arg.GetString(0);
-            var page = int.Parse(arg.GetString(1));
-            switch (type)
-            {
-                case "remover":
-                    if (HasPerm(player))                    
-                        EventRemover(player, page);
-                    return;
-                case "config":
-                    if (HasPerm(player))
-                        SwitchConfig(player, page);
-                    return;
-                case "autoevent":
-                    if (HasPerm(player))
-                        EventAutoEvent(player, page);
-                    return;
-                case "vote":
-                    CreateVoting(player, page);
-                    return;
-                case "join":
-                    JoinSelectionMenu(player, page);
-                    return;
-                case "kick":
-                    KickSelectionMenu(player, page);
-                    return;
-                default:
-                    break;
-            }
-        }
-        [ConsoleCommand("EMI_AutoEditor")]
-        private void ccmdAutoEditor(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            DestroyEntries(player);
-            if (!HasPerm(player)) return;
-
-            var type = arg.GetString(0);
-            var num = int.Parse(arg.GetString(1));
-            switch (type)
-            {
-                case "cancel":
-                    if (Event_Config.AutoEvent_Config.AutoCancel)
-                    {
-                        Event_Config.AutoEvent_Config.AutoCancel = false;
-                        SaveData();
-                        EventAutoEvent(player);
-                        PopupMessage(player, msg("You have disabled the auto cancel timer for auto events", player));
-                        return;
-                    }
-                    else
-                    {
-                        Event_Config.AutoEvent_Config.AutoCancel = true;
-                        SaveData();
-                        EventAutoEvent(player);
-                        PopupMessage(player, msg("You have enabled the auto cancel timer for auto events", player));
-                        return;
-                    }
-                case "gameinterval":
-                    if (num < 1) num = 1;
-                    Event_Config.AutoEvent_Config.GameInterval = num;                    
-                    SaveData();
-                    EventAutoEvent(player);
-                    return;
-                case "canceltimer":
-                    if (num < 1) num = 1;
-                    Event_Config.AutoEvent_Config.AutoCancel_Timer = num;                    
-                    SaveData();
-                    EventAutoEvent(player);
-                    return;
-                case "randomize":
-                    EventManager._RandomizeAuto = !EventManager._RandomizeAuto;                    
-                    EventAutoEvent(player);
-                    return;
-                default:
-                    break;
-            }
-        }
-        [ConsoleCommand("EMI_Control")]
-        private void ccmdControls(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            if (!HasPerm(player)) return;
-            DestroyEntries(player);
-            switch (arg.Args[0].ToLower())
-            {
-                case "open":
-                    {
-                        var success = EventManager.OpenEvent();
-                        if (success is string)
-                        {
-                            PopupMessage(player, (string)success);
-                            return;
-                        }
-                        else EventControl(player);
-                    }
-                    return;
-                case "close":
-                    {
-                        var success = EventManager.CloseEvent();
-                        if (success is string)
-                        {
-                            PopupMessage(player, (string)success);
-                            return;
-                        }
-                        else EventControl(player);
-                    }                    
-                    return;
-                case "start":
-                    {
-                        var success = EventManager.StartEvent();
-                        if (success is string)
-                        {
-                            PopupMessage(player, (string)success);
-                            return;
-                        }
-                        else if (!EventManager.isPlaying(player))
-                            EventControl(player);
-                    }
-                    return;
-                case "end":
-                    {
-                        var success = EventManager.EndEvent();
-                        if (success is string)
-                        {
-                            PopupMessage(player, (string)success);
-                            return;
-                        }
-                        else EventControl(player);
-                    }
-                    return;
-                case "config":
-                    {
-                        if (EventManager._Started || EventManager._Open)
-                        {
-                            PopupMessage(player, msg("You can not switch event config whilst a game is underway", player));
-                            return;
-                        }
-                        else SwitchConfig(player);
-                    }
-                    return;
-                case "kit":
-                    if (arg.Args.Length > 1)
-                    {
-                        string kit = arg.GetString(1);
-                        if (kit == "None") kit = "";
-                        EventManager._Event.Kit = kit;
-
-                        if (!string.IsNullOrEmpty(kit))
-                            Interface.CallHook("OnSelectKit", kit);
-
-                        EventControl(player);
-                        PopupMessage(player, $"{msg("You have changed the event kit to:", player)} {Color1}{kit}</color>", false);
-                    }
-                    else KitSelection(player, "EMI_Control");
-                    return;
-                case "gamemode":                    
-                    {
-                        if (EventManager._Started || EventManager._Open)
-                        {
-                            PopupMessage(player, msg("You can not switch the game mode whilst a game is underway", player));
-                            return;
-                        }
-                        string mode = arg.GetString(1);
-                        if (mode == "normal") EventManager._Event.GameMode = EventManager.GameMode.Normal;
-                        else { EventManager._Event.GameMode = EventManager.GameMode.Battlefield; EventManager._Event.ScoreLimit = 0; }
-                        EventControl(player);
-                        PopupMessage(player, $"{msg("You have changed the game mode to:", player)} {Color1}{EventManager._Event.GameMode}</color>", false);
-                    }                    
-                    return;
-                case "ggconfig":
-                    if (arg.Args.Length > 1)
-                    {
-                        if (EventManager._Started || EventManager._Open)
-                        {
-                            PopupMessage(player, msg("You can not change weapon set whilst a game is underway", player));
-                            return;
-                        }
-                        string set = arg.GetString(1);
-                        if (set == "None") set = "";
-                        EventManager._Event.WeaponSet = set;
-
-                        if (!string.IsNullOrEmpty(set))
-                            Interface.CallHook("ChangeWeaponSet", set);
-
-                        EventControl(player);
-                        PopupMessage(player, $"{msg("You have changed the weapon set to:", player)} {Color1}{set}</color>", false);
-                    }
-                    else KitSelection(player, "EMI_Control", true);
-                    return;
-                case "maxplayers":
-                    int max = arg.GetInt(1);
-                    EventManager._Event.MaximumPlayers = max;
-                    EventControl(player); 
-                    return;
-                case "scorelimit":
-                    int score = arg.GetInt(1);
-                    EventManager._Event.ScoreLimit = score;
-                    Interface.CallHook("SetScoreLimit", score);
-                    EventControl(player);
-                    return;
-                case "enemycount":
-                    var enemies = arg.GetInt(1);
-                    EventManager._Event.EnemiesToSpawn = enemies;
-                    if (enemies > 0)
-                        Interface.CallHook("SetEnemyCount", enemies);
-                    EventControl(player);
-                    return;
-                case "roundcount":
-                    var rounds = arg.GetInt(1);
-                    EventManager._Event.GameRounds = rounds;
-                    if (rounds > 0)
-                        Interface.CallHook("SetGameRounds", rounds);
-                    EventControl(player);
-                    return;
-                case "type":
-                    if (EventManager._Started || EventManager._Open)
-                    {
-                        PopupMessage(player, msg("You can not switch event type whilst a game is underway", player));
-                        return;
-                    }
-                    if (arg.Args.Length > 1)
-                    {
-                        string type = arg.GetString(1);
-                        EventManager._Event = new EventManager.Events { EventType = type, MinimumPlayers = 2, RespawnTimer = 10 };
-                        EventManager._CurrentEventConfig = null;
-                        var success = EventManager.SelectEvent(type);
-                        if (success is string)
-                        {
-                            PopupMessage(player, (string) success, false);
-                            return;
-                        }
-                        EventControl(player);
-                        PopupMessage(player, $"{msg("You have changed the event type to:", player)} {Color1}{type}</color>", false);
-                    }
-                    else EventSelection(player, "EMI_Control");
-                    return;
-                case "spawns":
-                    if (EventManager._Started || EventManager._Open)
-                    {
-                        PopupMessage(player, msg("You can not switch event spawn file whilst a game is underway", player));
-                        return;
-                    }
-                    if (arg.Args.Length > 1)
-                    {
-                        string spawns = arg.GetString(1);
-                        EventManager._Event.Spawnfile = spawns;
-                        EventControl(player);
-                        PopupMessage(player, $"{msg("You have changed the event spawn file to:", player)} {Color1}{spawns}</color>", false);
-                    }
-                    else SpawnSelection(player, "EMI_Control spawns");
-                    return;
-                case "spawns2":
-                    if (EventManager._Started || EventManager._Open)
-                    {
-                        PopupMessage(player, msg("You can not switch event spawn file whilst a game is underway", player));
-                        return;
-                    }
-                    if (arg.Args.Length > 1)
-                    {
-                        string spawns = arg.GetString(1);
-                        EventManager._Event.Spawnfile2 = spawns;
-                        EventControl(player);
-                        PopupMessage(player, $"{msg("You have changed the second spawn file to:", player)} {Color1}{spawns}</color>", false);
-                    }
-                    else SpawnSelection(player, "EMI_Control spawns2");
-                    return;
-                case "zone":
-                    if (EventManager._Started || EventManager._Open)
-                    {
-                        PopupMessage(player, msg("You can not switch event zone whilst a game is underway", player));
-                        return;
-                    }
-                    if (arg.Args.Length > 1)
-                    {
-                        string zone = arg.GetString(1);
-                        EventManager._Event.ZoneID = zone;
-                        EventControl(player);
-                        PopupMessage(player, $"{msg("You have changed the event zone to:", player)} {Color1}{zone}</color>", false);
-                    }
-                    else ZoneSelection(player, "EMI_Control");
-                    return;
-                case "classtoggle":
-                    EventManager._Event.UseClassSelector = !EventManager._Event.UseClassSelector;
-                    EventControl(player);
-                    return;                
-                case "pickuptoggle":
-                    EventManager._Event.DisableItemPickup = !EventManager._Event.DisableItemPickup;
-                    EventControl(player);
-                    return;               
-                case "costoggle":
-                    EventManager._Event.CloseOnStart = !EventManager._Event.CloseOnStart;
-                    EventControl(player);
-                    return;               
-                case "respawn":
-                    {
-                        if (EventManager._Started || EventManager._Open)
-                        {
-                            PopupMessage(player, msg("You can not change respawn type during a match!", player));
-                            return;
-                        }
-                        switch (arg.Args[1])
-                        {
-                            case "none":
-                                EventManager._Event.RespawnType = EventManager.RespawnType.None;
-                                break;
-                            case "timer":
-                                EventManager._Event.RespawnType = EventManager.RespawnType.Timer;
-                                break;
-                            case "wave":
-                                EventManager._Event.RespawnType = EventManager.RespawnType.Waves;
-                                break;                            
-                        }
-                        EventControl(player);
-                    }
-                    return;
-                case "spawntype":
-                    {
-                        if (EventManager._Started || EventManager._Open)
-                        {
-                            PopupMessage(player, msg("You can not change spawn type during a match!", player));
-                            return;
-                        }
-                        switch (arg.Args[1])
-                        {
-                            case "seq":
-                                EventManager._Event.SpawnType = EventManager.SpawnType.Consecutive;
-                                break;
-                            case "rand":
-                                EventManager._Event.SpawnType = EventManager.SpawnType.Random;
-                                break;                           
-                        }
-                        EventControl(player);
-                    }
-                    return;
-                case "respawntime":
-                    var time = arg.GetInt(1);
-                    EventManager._Event.RespawnTimer = time;
-                    EventControl(player);
-                    return;
-                case "aeenable":
-                    {
-                        var success = EventManager.LaunchEvent();
-                        if (success is string)
-                        {
-                            PopupMessage(player, (string)success);
-                            return;
-                        }
-                        else EventAutoEvent(player);
-                    }                    
-                    return;
-                case "aedisable":
-                    {
-                        EventManager.CancelAutoEvent("AutoEvents disabled");                        
-                        EventAutoEvent(player);
-                    }
-                    return;
-                case "nextevent":
-                    NextAutoConfig(player);
-                    return;                
-                default:
-                    break;
-            }
-        }
-        [ConsoleCommand("EMI_Creator")]
-        private void ccmdCreator(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            if (!HasPerm(player)) return;
-            DestroyEntries(player);
-            var newEvent = EventCreators[player.userID];
-            switch (arg.Args[0].ToLower())
-            {                
-                case "kit":
-                    if (arg.Args.Length > 1)
-                    {
-                        var kit = arg.GetString(1);
-                        if (kit == "None") kit = "";
-                        newEvent.Kit = kit;
-                        EventCreator(player);
-                    }
-                    else KitSelection(player, "EMI_Creator");
-                    return;
-                case "gamemode":
-                    {
-                        string mode = arg.GetString(1);
-                        if (mode == "normal") newEvent.GameMode = EventManager.GameMode.Normal;
-                        else { newEvent.GameMode = EventManager.GameMode.Battlefield; newEvent.ScoreLimit = 0; }
-                            EventCreator(player);
-                    }
-                    return;
-                case "ggconfig":
-                    if (arg.Args.Length > 1)
-                    {
-                        var set = arg.GetString(1);
-                        if (set == "None") set = "";
-                        newEvent.WeaponSet = set;
-                        EventCreator(player);
-                    }
-                    else KitSelection(player, "EMI_Creator", true);
-                    return;                
-                case "type":
-                    if (arg.Args.Length > 1)
-                    {
-                        var type = arg.GetString(1);
-                        newEvent.EventType = type;                        
-                        EventCreator(player);
-                    }
-                    else EventSelection(player, "EMI_Creator");
-                    return;
-                case "spawns":
-                    if (arg.Args.Length > 1)
-                    {
-                        var spawns = arg.GetString(1);
-                        newEvent.Spawnfile = spawns;
-                        EventCreator(player);
-                    }
-                    else SpawnSelection(player, "EMI_Creator spawns");
-                    return;
-                case "spawns2":
-                    if (arg.Args.Length > 1)
-                    {
-                        var spawns = arg.GetString(1);
-                        newEvent.Spawnfile2 = spawns;
-                        EventCreator(player);
-                    }
-                    else SpawnSelection(player, "EMI_Creator spawns2");
-                    return;
-                case "scorelimit":
-                    int score = arg.GetInt(1);
-                    newEvent.ScoreLimit = score;
-                    EventCreator(player);
-                    return;
-                case "zone":
-                    if (arg.Args.Length > 1)
-                    {
-                        var zone = arg.GetString(1);
-                        newEvent.ZoneID = zone;
-                        EventCreator(player);
-                    }
-                    else ZoneSelection(player, "EMI_Creator");
-                    return;
-                case "classtoggle":
-                    newEvent.UseClassSelector = !newEvent.UseClassSelector;
-                    EventCreator(player);
-                    return;                
-                case "pickuptoggle":
-                    newEvent.DisableItemPickup = !newEvent.DisableItemPickup;
-                    EventCreator(player);
-                    return;               
-                case "costoggle":
-                    newEvent.CloseOnStart = !newEvent.CloseOnStart;
-                    EventCreator(player);
-                    return;               
-                case "min":
-                    var min = arg.GetInt(1);
-                    if (min < 0) min = 0;
-                    newEvent.MinimumPlayers = min;
-                    EventCreator(player);
-                    return;
-                case "max":
-                    var max = arg.GetInt(1);
-                    if (max < 0) max = 0;
-                    newEvent.MaximumPlayers = max;
-                    EventCreator(player);
-                    return;
-                case "enemycount":
-                    var enemies = arg.GetInt(1);
-                    newEvent.EnemiesToSpawn = enemies;
-                    EventCreator(player);                    
-                    return;
-                case "roundcount":
-                    var rounds = arg.GetInt(1);
-                    newEvent.GameRounds = rounds;
-                    EventCreator(player);
-                    return;
-                case "respawn":
-                    {
-                        switch (arg.Args[1])
-                        {
-                            case "none":
-                                newEvent.RespawnType = EventManager.RespawnType.None;
-                                break;
-                            case "timer":
-                                newEvent.RespawnType = EventManager.RespawnType.Timer;
-                                break;
-                            case "wave":
-                                newEvent.RespawnType = EventManager.RespawnType.Waves;
-                                break;
-                        }
-                        EventCreator(player);
-                    }
-                    return;
-                case "spawntype":
-                    {                        
-                        switch (arg.Args[1])
-                        {
-                            case "seq":
-                                newEvent.SpawnType = EventManager.SpawnType.Consecutive;
-                                break;
-                            case "rand":
-                                newEvent.SpawnType = EventManager.SpawnType.Random;
-                                break;
-                        }
-                        EventCreator(player);
-                    }
-                    return;
-                case "respawntime":
-                    var time = arg.GetInt(1);
-                    newEvent.RespawnTimer = time;
-                    EventCreator(player);
-                    return;
-                case "saveconf":
-                    var success = EventManager.ValidateEvent(newEvent);
-                    if (success is string)
-                    {
-                        EventCreator(player);
-                        PopupMessage(player, (string)success, false);
-                        return;
-                    }
-                    else
-                    {
-                        int i = 1;
-                        foreach(var eventconf in Event_Config.Event_List)
-                        {
-                            if (eventconf.Value.EventType == newEvent.EventType)
-                                i++;
-                        }
-                        var name = $"{newEvent.EventType}_{i}";
-                        if (Event_Config.Event_List.ContainsKey(name))
-                            name += UnityEngine.Random.Range(1, 10000);
-                        if (Event_Config.Event_List.ContainsKey(name))
-                            Event_Config.Event_List[name] = newEvent;
-                        else Event_Config.Event_List.Add(name, newEvent);
-                        if (EventManager.ValidEvents.ContainsKey(name))
-                            EventManager.ValidEvents[name] = newEvent;
-                        else EventManager.ValidEvents.Add(name, newEvent);
-                        SaveData();
-                        EventControl(player);
-                        PopupMessage(player, string.Format(msg("CreateSuccess", player), Color1, name), false, 8);
-                    }
-                    return;              
-                default:
-                    break;
-            }
-        }
-
-        [ConsoleCommand("EMI_ChangeClass")]
-        private void ccmdChangeClass(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            string kit = string.Join(" ", arg.Args);
-            if (EventManager.isPlaying(player))
-            {
-                var ePlayer = player.GetComponent<EventManager.EventPlayer>();
-                if (Event_Config.Classes.Contains(kit))
+                if (arg.HasArgs(1))
                 {
-                    bool noGear = false;
-                    if (string.IsNullOrEmpty(ePlayer.currentClass)) noGear = true;
-                    ePlayer.currentClass = kit;
-                    if (noGear)
+                    EventManager.EventConfig eventConfig;
+                    if (!_eventCreators.TryGetValue(player.userID, out eventConfig))
                     {
-                        EventManager.GivePlayerKit(player, kit);
-                        DestroyAllUI(player);
-                        return;
+                        string eventName = CommandSafe(arg.GetString(0), true);
+
+                        EventManagerEx.IEventPlugin eventPlugin = EventManager.Instance.GetPlugin(eventName);
+
+                        if (eventPlugin == null)
+                            return;
+
+                        _eventCreators[player.userID] = eventConfig = new EventManager.EventConfig(eventName, eventPlugin);
                     }
-                    else
+                }
+
+                OpenMenu(player, new MenuArgs(AdminTab.CreateEvent));
+            }
+        }
+
+        [ConsoleCommand("emui.saveevent")]
+        private void ccmdSaveEvent(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
+            {
+                EventManager.EventConfig eventConfig;
+                if (!_eventCreators.TryGetValue(player.userID, out eventConfig))
+                    return;
+
+                object success = EventManager.Instance.ValidateEventConfig(eventConfig);
+                if (success == null)
+                {
+                    EventManager.SaveEventConfig(eventConfig);
+                    _eventCreators.Remove(player.userID);
+
+                    OpenMenu(player, new MenuArgs(AdminTab.None));
+
+                    CreateMenuPopup(player, $"Successfully saved event {eventConfig.EventName}");
+                }
+                else CreateMenuPopup(player, (string)success);
+            }
+        }
+
+        [ConsoleCommand("emui.disposeevent")]
+        private void ccmdDisposeEvent(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            _eventCreators.Remove(player.userID);
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
+            {
+                OpenMenu(player, new MenuArgs(AdminTab.None));
+                CreateMenuPopup(player, "Cancelled event creation");
+            }
+        }
+
+        [ConsoleCommand("emui.clear")]
+        private void ccmdClearField(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            EventManager.EventConfig eventConfig;
+            if (!_eventCreators.TryGetValue(player.userID, out eventConfig))
+                return;
+
+            string fieldName = arg.GetString(0);
+
+            switch (fieldName)
+            {
+                case "eventName":
+                    eventConfig.EventName = string.Empty;
+                    break;
+                case "zoneID":
+                    eventConfig.ZoneID = string.Empty;
+                    break;
+                case "timeLimit":
+                    eventConfig.TimeLimit = 0;
+                    break;
+                case "scoreLimit":
+                    eventConfig.ScoreLimit = 0;
+                    break;
+                case "minimumPlayers":
+                    eventConfig.MinimumPlayers = 0;
+                    break;
+                case "maximumPlayers":
+                    eventConfig.MaximumPlayers = 0;
+                    break;
+                case "teamASpawnfile":
+                    eventConfig.TeamConfigA.Spawnfile = string.Empty;
+                    break;
+                case "teamBSpawnfile":
+                    eventConfig.TeamConfigB.Spawnfile = string.Empty;
+                    break;
+                case "teamAColor":
+                    eventConfig.TeamConfigA.Color = string.Empty;
+                    break;
+                case "teamBColor":
+                    eventConfig.TeamConfigB.Color = string.Empty;
+                    break;
+                default:
+                    foreach (KeyValuePair<string, object> kvp in eventConfig.AdditionalParams)
                     {
-                        DestroyPanelUI(player);
-                        DestroyAdminUI(player);
-                        DestroyPopupUI(player);
-                        DestroyEntries(player);
-                        ClassSelector(player);
+                        if (kvp.Key.Equals(fieldName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            eventConfig.AdditionalParams[fieldName] = null;
+                            break;
+                        }
+                    }
+                    break;
+            }
+
+            OpenMenu(player, new MenuArgs(AdminTab.CreateEvent));
+        }
+
+        [ConsoleCommand("emui.creator")]
+        private void ccmdSetField(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            EventManager.EventConfig eventConfig;
+            if (!_eventCreators.TryGetValue(player.userID, out eventConfig))
+                return;
+
+            if (arg.HasArgs(2))
+            {
+                SetParameter(player, eventConfig, arg.GetString(0), string.Join(" ", arg.Args.Skip(1)));
+
+                OpenMenu(player, new MenuArgs(AdminTab.CreateEvent));
+            }
+        }
+
+        #region Creator Helpers
+        private void SetParameter(BasePlayer player, EventManager.EventConfig eventConfig, string fieldName, object value)
+        {
+            if (value == null)
+                return;
+
+            switch (fieldName)
+            {
+                case "eventName":
+                    eventConfig.EventName = (string)value;
+                    break;
+                case "zoneID":
+                    eventConfig.ZoneID = (string)value;
+                    break;
+                case "timeLimit":
+                    {
+                        int intValue;
+                        if (!TryConvertValue<int>(value, out intValue))
+                            CreateMenuPopup(player, "You must enter a number");
+                        else eventConfig.TimeLimit = intValue;
+                    }                   
+                    break;
+                case "scoreLimit":
+                    {
+                        int intValue;
+                        if (!TryConvertValue<int>(value, out intValue))
+                            CreateMenuPopup(player, "You must enter a number");
+                        else eventConfig.ScoreLimit = intValue;
                     }                    
+                    break;
+                case "minimumPlayers":
+                    {
+                        int intValue;
+                        if (!TryConvertValue<int>(value, out intValue))
+                            CreateMenuPopup(player, "You must enter a number");
+                        else eventConfig.MinimumPlayers = intValue;
+                    }                    
+                    break;
+                case "maximumPlayers":
+                    {
+                        int intValue;
+                        if (!TryConvertValue<int>(value, out intValue))
+                            CreateMenuPopup(player, "You must enter a number");
+                        else eventConfig.MaximumPlayers = intValue;
+                    }                    
+                    break;
+                case "teamASpawnfile":
+                    eventConfig.TeamConfigA.Spawnfile = (string)value;
+                    break;
+                case "teamBSpawnfile":
+                    eventConfig.TeamConfigB.Spawnfile = (string)value;
+                    break;
+                case "useClassSelector":
+                    {
+                        bool boolValue;
+                        if (!TryConvertValue<bool>(value, out boolValue))
+                            CreateMenuPopup(player, "You must enter 'True' or 'False'");
+                        else eventConfig.AllowClassSelection = boolValue;
+                    }
+                    break;
+                case "teamAKits":
+                    AddToRemoveFromList(eventConfig.TeamConfigA.Kits, (string)value);
+                    break;
+                case "teamBKits":
+                    AddToRemoveFromList(eventConfig.TeamConfigB.Kits, (string)value);
+                    break;
+                case "teamAClothing":
+                    eventConfig.TeamConfigA.Clothing = (string)value;
+                    break;
+                case "teamBClothing":
+                    eventConfig.TeamConfigB.Clothing = (string)value;
+                    break;
+                case "teamAColor":
+                    {
+                        string color = (string)value;
+                        if (string.IsNullOrEmpty(color) || color.Length < 6 || color.Length > 6 || !EventManager.IsValidHex(color))
+                            CreateMenuPopup(player, "The color must be a 6 digit hex color, without the # prefix");
+                        else eventConfig.TeamConfigA.Color = color;
+                        break;
+                    }
+                case "teamBColor":
+                    {
+                        string color = (string)value;
+                        if (string.IsNullOrEmpty(color) || color.Length < 6 || color.Length > 6 || !EventManager.IsValidHex(color))
+                            CreateMenuPopup(player, "The color must be a 6 digit hex color, without the # prefix");
+                        else eventConfig.TeamConfigB.Color = color;
+                        break;
+                    }
+                default:
+                    List<EventManager.EventParameter> additionalParameters = eventConfig.Plugin?.AdditionalParameters;
+                    if (additionalParameters != null)
+                    {
+                        for (int i = 0; i < additionalParameters.Count; i++)
+                        {
+                            EventManager.EventParameter eventParameter = additionalParameters[i];
+
+                            if (!eventConfig.AdditionalParams.ContainsKey(eventParameter.Field))
+                            {
+                                if (eventParameter.IsList)
+                                    eventConfig.AdditionalParams[eventParameter.Field] = new List<string>();
+                                else eventConfig.AdditionalParams[eventParameter.Field] = eventParameter.DefaultValue == null ? null : eventParameter.DefaultValue;
+                            }
+
+                            if (fieldName.Equals(eventParameter.Field, StringComparison.OrdinalIgnoreCase))
+                            {
+                                object success = eventConfig.Plugin.ParameterIsValid(fieldName, value);
+                                if (success != null)
+                                {
+                                    CreateMenuPopup(player, (string)success);
+                                    return;
+                                }
+
+                                switch (eventParameter.DataType)
+                                {
+                                    case "string":
+                                        eventConfig.AdditionalParams[eventParameter.Field] = (string)value;
+                                        break;
+                                    case "int":
+                                        int intValue;
+                                        if (!TryConvertValue<int>(value, out intValue))
+                                            CreateMenuPopup(player, "You must enter a number");
+                                        else eventConfig.AdditionalParams[eventParameter.Field] = intValue;
+                                        break;
+                                    case "float":
+                                        float floatValue;
+                                        if (!TryConvertValue<float>(value, out floatValue))
+                                            CreateMenuPopup(player, "You must enter a number");
+                                        else eventConfig.AdditionalParams[eventParameter.Field] = floatValue;                                        
+                                        break;
+                                    case "bool":
+                                        bool boolValue;
+                                        if (!TryConvertValue<bool>(value, out boolValue))
+                                            CreateMenuPopup(player, "You must enter 'True' or 'False'");
+                                        else eventConfig.AdditionalParams[eventParameter.Field] = boolValue;                                        
+                                        break;
+                                    case "List<string>":
+                                        AddToRemoveFromList(eventConfig.AdditionalParams[eventParameter.Field] as List<string>, (string)value);
+                                        break;
+                                    default:
+                                        break;
+                                }
+                            }
+                        }
+                    }
+                    return;
+            }
+        }
+
+        private bool TryConvertValue<T>(object value, out T result)
+        {
+            try
+            {
+                result = (T)Convert.ChangeType(value, typeof(T));
+                return true;
+            }
+            catch
+            {
+                result = default(T);
+                return false;
+            }            
+        }
+
+        private void AddToRemoveFromList(List<string> list, string value)
+        {
+            if (list.Contains(value))
+                list.Remove(value);
+            else list.Add(value);
+        }
+        #endregion
+        #endregion
+
+        #region Death Screen Commands
+        [ConsoleCommand("emui.toggleautospawn")]
+        private void ccmdToggleAutoSpawn(ConsoleSystem.Arg arg)
+        {
+            EventManager.BaseEventPlayer eventPlayer = arg.Player()?.GetComponent<EventManager.BaseEventPlayer>();
+            if (eventPlayer == null || !eventPlayer.IsDead)
+                return;
+
+            eventPlayer.AutoRespawn = !eventPlayer.AutoRespawn;
+            UpdateRespawnButton(eventPlayer);
+        }
+
+        [ConsoleCommand("emui.respawn")]
+        private void ccmdRespawn(ConsoleSystem.Arg arg)
+        {
+            EventManager.BaseEventPlayer eventPlayer = arg.Player()?.GetComponent<EventManager.BaseEventPlayer>();
+            if (eventPlayer == null || !eventPlayer.IsDead || !eventPlayer.CanRespawn)
+                return;
+
+            if (string.IsNullOrEmpty(eventPlayer.Kit))
+                return;
+
+            eventPlayer.IsSelectingClass = false;
+
+            EventManager.RespawnPlayer(eventPlayer);            
+        }
+
+        [ConsoleCommand("emui.selectkit")]
+        private void ccmdSelectKit(ConsoleSystem.Arg arg)
+        {
+            EventManager.BaseEventPlayer eventPlayer = arg.Player()?.GetComponent<EventManager.BaseEventPlayer>();
+            if (eventPlayer == null || !eventPlayer.IsDead)
+                return;
+
+            eventPlayer.Kit = CommandSafe(arg.GetString(0), true);
+            eventPlayer.IsSelectingClass = arg.GetBool(1);
+
+            UpdateRespawnButton(eventPlayer);
+        }
+        #endregion
+
+        #region General Commands
+        [ConsoleCommand("emui.close")]
+        private void ccmdCloseUI(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            CuiHelper.DestroyUi(player, UI_MENU);
+            CuiHelper.DestroyUi(player, UI_POPUP);
+        }
+
+        [ConsoleCommand("emui.joinevent")]
+        private void ccmdJoinEvent(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (EventManager.BaseManager.CanJoinEvent(player))
+            {
+                EventManager.BaseManager.JoinEvent(player);
+
+                if (EventManager.BaseManager.Status < EventManager.EventStatus.Prestarting)
+                {
+                    OpenMenu(player, new MenuArgs(MenuTab.Event));
+                    CreateMenuPopup(player, Message("UI.Popup.EnterEvent", player.userID));
                 }
             }
-
-        }
-        [ConsoleCommand("EMI_DeathChangeClass")]
-        private void ccmdDeathChangeClass(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            string kit = string.Join(" ", arg.Args);
-            if (kit == "$close$")
-            {
-                CuiHelper.DestroyUi(player, UIPanel);
-                return;
-            }
-            if (EventManager.isPlaying(player))
-            {
-                var ePlayer = player.GetComponent<EventManager.EventPlayer>();
-                if (Event_Config.Classes.Contains(kit))
-                {
-                    ePlayer.currentClass = kit;
-                    DeathClassSelector(player);
-                }
-            }
-
-        }
-        [ConsoleCommand("EMI_AddClass")]
-        private void ccmdAddClass(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            if (HasPerm(player))
-            {
-                if (Event_Config.Classes.Count >= 16)
-                {
-                    PopupMessage(player, msg("You have reached the class limit", player), false);
-                    return;
-                }
-                string kit = arg.Args[0];
-                Event_Config.Classes.Add(kit);
-                GetKitItems(kit);
-                SaveData();
-                EventClasses(player);
-                PopupMessage(player, string.Format(msg("You have added the kit {0}' {1} ' </color> to the class list", player), Color1, kit), false);
-            }
-        }
-        [ConsoleCommand("EMI_RemoveClass")]
-        private void ccmdRemoveClass(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            if (HasPerm(player))
-            {
-                string kit = arg.Args[0];
-                Event_Config.Classes.Remove(kit);
-                SaveData();
-                EventClasses(player);
-                PopupMessage(player, string.Format(msg("You have removed the kit {0}' {1} '</color> from the class list", player), Color1, kit), false);
-            }
         }
 
-        [ConsoleCommand("EMI_SelectConfig")]
-        private void ccmdSelectConfig(ConsoleSystem.Arg arg)
+        [ConsoleCommand("emui.leaveevent")]
+        private void ccmdLeaveEvent(ConsoleSystem.Arg arg)
         {
-            var player = arg.Connection.player as BasePlayer;
+            BasePlayer player = arg.Player();
             if (player == null)
                 return;
-            if (HasPerm(player))
+
+            DestroyAllUI(player);
+
+            EventManager.BaseManager.LeaveEvent(player);
+
+            if (EventManager.BaseManager.Status < EventManager.EventStatus.Prestarting)
             {
-                EventManager._Event = Event_Config.Event_List[arg.GetString(0)];
-                EventManager._CurrentEventConfig = arg.Args[0];
-                EventControl(player);
+                OpenMenu(player, new MenuArgs(MenuTab.Event));
+                CreateMenuPopup(player, Message("UI.Popup.LeaveEvent", player.userID));
             }
         }
-        [ConsoleCommand("EMI_NextAutoConfig")]
-        private void ccmdNextAutoConfig(ConsoleSystem.Arg arg)
+        #endregion
+
+        #region Menu Selection
+        [ConsoleCommand("emui.statistics")]
+        private void ccmdStatistics(ConsoleSystem.Arg arg)
         {
-            var player = arg.Connection.player as BasePlayer;
+            BasePlayer player = arg.Player();
             if (player == null)
                 return;
-            if (HasPerm(player))
-            {
-                EventManager._NextEventNum = arg.GetInt(0);
-                EventManager._NextConfigName = arg.GetString(1);
-                EventManager._ForceNextConfig = true;
-                EventAutoEvent(player);
-            }
+
+            OpenMenu(player, new MenuArgs((StatisticTab)arg.GetInt(0), (EventStatistics.Statistic)arg.GetInt(1), arg.GetInt(2)));
         }
-        [ConsoleCommand("EMI_NewAutoConfig")]
-        private void ccmdNewAutoConfig(ConsoleSystem.Arg arg)
+
+        [ConsoleCommand("emui.event")]
+        private void ccmdEvent(ConsoleSystem.Arg arg)
         {
-            var player = arg.Connection.player as BasePlayer;
+            BasePlayer player = arg.Player();
             if (player == null)
                 return;
-            if (HasPerm(player))
+
+            _eventCreators.Remove(player.userID);
+
+            OpenMenu(player, new MenuArgs(arg.GetInt(0), (MenuTab)arg.GetInt(1)));
+        }
+        #endregion
+
+        #region Event Management
+        [ConsoleCommand("emui.eventselector")]
+        private void ccmdOpenEventSelector(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                var autocfg = AutoCreators[player.userID];
-                if (autocfg == null) return;
-                switch (arg.GetString(0))
+                AdminTab adminTab = (AdminTab)arg.GetInt(0);
+
+                switch (adminTab)
                 {
-                    case "newconf":
-                        if (arg.Args.Length == 2)
-                        {
-                            var confname = arg.GetString(1);
-                            autocfg.EventConfig = confname;
-                            EventAutoEvent(player);
-                            return;
-                        }
-                        else NewAutoConfig(player);
-                        return;
-                    case "jointimer":
-                        var jointime = int.Parse(arg.GetString(1));
-                        if (jointime < 0) jointime = 0;
-                        autocfg.TimeToJoin = jointime;
-                        EventAutoEvent(player);
-                        return;
-                    case "starttimer":
-                        var starttime = int.Parse(arg.GetString(1));
-                        if (starttime < 0) starttime = 0;
-                        autocfg.TimeToStart = starttime;
-                        EventAutoEvent(player);
-                        return;
-                    case "timelimit":
-                        var timelim = int.Parse(arg.GetString(1));
-                        if (timelim < 0) timelim = 0;
-                        autocfg.TimeLimit = timelim;
-                        EventAutoEvent(player);
-                        return;
-                    case "saveconfig":
-                        if (string.IsNullOrEmpty(autocfg.EventConfig))
-                        {
-                            PopupMessage(player, msg("You need to select a event config", player), false, 5);
-                            return;
-                        }
-                        if (autocfg.TimeLimit < 1)
-                        {
-                            PopupMessage(player, msg("You need to set a time limit of atleast 1 minute", player), false, 5);
-                            return;
-                        }
-                        Event_Config.AutoEvent_Config.AutoEvent_List.Add(autocfg);
-                        EventManager.ValidAutoEvents.Add(autocfg);
-                        SaveData();
-                        AutoCreators[player.userID] = new AEConfig();
-                        EventAutoEvent(player);
-                        PopupMessage(player, msg("You have successfully added a new auto event", player), false, 5);
-                        return;
+                    case AdminTab.OpenEvent:
+                        OpenMenu(player, new MenuArgs(new SelectorArgs("Select an event to open", SelectionType.Event, "emui.openevent"), adminTab, 0));
+                        break;
+                    case AdminTab.EditEvent:
+                        OpenMenu(player, new MenuArgs(new SelectorArgs("Select an event to edit", SelectionType.Event, "emui.editevent"), adminTab, 0));
+                        break;
+                    case AdminTab.DeleteEvent:
+                        OpenMenu(player, new MenuArgs(new SelectorArgs("Select an event to delete", SelectionType.Event, "emui.deleteevent"), adminTab, 0));
+                        break;
                     default:
                         break;
                 }
             }
         }
-        [ConsoleCommand("EMI_KickPlayer")]
-        private void ccmdKickPlayer(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            var ID = arg.Args[0];
-            var target = BasePlayer.FindByID(ulong.Parse(ID));
-            if (target != null)
-            {
-                EventManager.LeaveEvent(target);
-                KickSelectionMenu(player);
-                PopupMessage(player, string.Format(msg("You have kicked: {0}", player), target.displayName));
-                PopupMessage(target, msg("You have been kicked from the event", target));                
-            }                
-        }
-        [ConsoleCommand("EMI_LeaveEvent")]
-        private void ccmdLeaveEvent(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;            
-            PopupMessage(player, msg("You have left the event", player));
-            EventManager.LeaveEvent(player);
-            CreateHome(player);           
-        }
-        [ConsoleCommand("EMI_JoinEvent")]
-        private void ccmdJoinEvent(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;            
-            EventManager.JoinEvent(player);
-            if (!EventManager._Started)
-                CreateHome(player);
-            PopupMessage(player, msg("You have joined the event", player));
-        }
-        [ConsoleCommand("EMI_JoinPlayer")]
-        private void ccmdJoinPlayer(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            var ID = arg.Args[0];
-            var target = BasePlayer.FindByID(ulong.Parse(ID));
-            if (target != null)
-            {
-                EventManager.JoinEvent(target);
-                JoinSelectionMenu(player);
-                PopupMessage(player, string.Format(msg("You have forced joined: {0}", player), target.displayName));
-                PopupMessage(target, msg("You have been sent to the event", player));                                
-            }
-        }
-        [ConsoleCommand("EMI_ClassDescription")]
-        private void ccmdClassDescription(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            string kit = string.Join(" ", arg.Args);
-            if (EventManager.isPlaying(player))
-            {
-                DestroyPanelUI(player);
-                ClassSelector(player, kit);
-            }
 
-        }
-        [ConsoleCommand("EMI_DestroyAll")]
-        private void ccmdDestroyAll(ConsoleSystem.Arg arg)
+        [ConsoleCommand("emui.openevent")]
+        private void ccmdOpenEvent(ConsoleSystem.Arg arg)
         {
-            var player = arg.Connection.player as BasePlayer;
+            BasePlayer player = arg.Player();
             if (player == null)
                 return;
-            DestroyAllUI(player);
-        }
-        [ConsoleCommand("EMI_RemoveEvent")]
-        private void ccmdRemoveEvent(ConsoleSystem.Arg arg)
-        {
-            var player = arg.Connection.player as BasePlayer;
-            if (player == null)
-                return;
-            if (HasPerm(player))
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                string name = arg.Args[0];
-                if (Event_Config.Event_List.ContainsKey(name))
+                string eventName = CommandSafe(arg.GetString(0), true);
+
+                object success = EventManager.Instance.OpenEvent(eventName);
+
+                if (success == null)
                 {
-                    Event_Config.Event_List.Remove(name);
-                    if (EventManager.ValidEvents.ContainsKey(name))
-                        EventManager.ValidEvents.Remove(name);
-                    if (EventManager._CurrentEventConfig == name)
-                        EventManager._Event = EventManager.DefaultConfig;
-                    SaveData();
-                    EventRemover(player);
-                    PopupMessage(player, string.Format(msg("You have removed the event config: {0}{1}</color>", player), Color1, name), false);
-                    return;
+                    CreateMenuPopup(player, $"Opened event {eventName}");
+                    OpenMenu(player, new MenuArgs(0, MenuTab.Event));
                 }
-                else 
-                PopupMessage(player, string.Format(msg("Error removing the event config: {0}{1}</color>", player), Color1, name), false);
+                else CreateMenuPopup(player, (string)success);
             }
         }
-        [ConsoleCommand("EMI_RemoveAutoEvent")]
-        private void ccmdRemoveAutoEvent(ConsoleSystem.Arg arg)
+
+        [ConsoleCommand("emui.endevent")]
+        private void ccmdEndEvent(ConsoleSystem.Arg arg)
         {
-            var player = arg.Connection.player as BasePlayer;
+            BasePlayer player = arg.Player();
             if (player == null)
                 return;
-            if (HasPerm(player))
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                int number = int.Parse(arg.GetString(0));
-                var conf = Event_Config.AutoEvent_Config.AutoEvent_List[number];
-                Event_Config.AutoEvent_Config.AutoEvent_List.Remove(conf);
-                SaveData();
-                EventAutoEvent(player);
-                PopupMessage(player, msg("You have successfully removed the event config from the roster", player), false);
-                return;
+                CreateMenuPopup(player, $"Cancelled event {EventManager.BaseManager.Config.EventName}");
+                EventManager.BaseManager.EndEvent();
+
+                OpenMenu(player, new MenuArgs(0, MenuTab.Admin));
             }
         }
-        [ConsoleCommand("EMI_EventVote")]
-        private void ccmdEventVote(ConsoleSystem.Arg arg)
+
+        [ConsoleCommand("emui.startevent")]
+        private void ccmdStartEvent(ConsoleSystem.Arg arg)
         {
-            var player = arg.Connection.player as BasePlayer;
+            BasePlayer player = arg.Player();
             if (player == null)
                 return;
-            DestroyEntries(player);
-            var args = arg.GetString(0);
-            switch (args)
-            {
-                case "vote":
-                    var number = int.Parse(arg.GetString(1));
-                    EventVotes.AddPlayerVote(player.userID, number);
-                    CreateVoting(player);
-                    PopupMessage(player, string.Format(msg("You have voted for Event {0}", player), number), false, 5);
-                    return;
-                case "unvote":
-                    EventVotes.RemovePlayerVote(player.userID);
-                    CreateVoting(player);
-                    PopupMessage(player, msg("You have retracted your vote", player), false, 5);
-                    return;
-                case "open":
-                    EventVotes.VoteOpenEvent(player.userID);
-                    CreateVoting(player);
-                    PopupMessage(player, msg("You have voted to open an event", player), false, 5);
-                    return;
-                default:
-                    break;
-            }
-        }
-        #endregion
 
-        #region UI Functions
-        public void DestroyMenuUI(BasePlayer player) => CuiHelper.DestroyUi(player, UIMain);        
-        public void DestroyPanelUI(BasePlayer player) => CuiHelper.DestroyUi(player, UIPanel);        
-        public void DestroyAdminUI(BasePlayer player) => CuiHelper.DestroyUi(player, UIAdmin);
-        public void DestroyPopupUI(BasePlayer player) => CuiHelper.DestroyUi(player, UIPopup);
-        public void DestroyEntries(BasePlayer player)
-        {
-            DestroyPopupUI(player);
-            if (UIEntries.ContainsKey(player.userID))
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                foreach (var entry in UIEntries[player.userID])
-                    CuiHelper.DestroyUi(player, entry);
-            }
-        }
-        public void DestroyAllUI(BasePlayer player)
-        {            
-            DestroyMenuUI(player);
-            DestroyPanelUI(player);
-            DestroyAdminUI(player);
-            DestroyPopupUI(player);
-            DestroyEntries(player);
-            OpenMap(player);
-        }
-        #endregion
-
-        #region Functions
-        private void GetRequiredVoteLoop()
-        {
-            if (configData.Voting.Standard_AllowVoteToOpen)
-            {
-                var required = Convert.ToInt32(BasePlayer.activePlayerList.Count * configData.Voting.Standard_RequiredVoteFraction);
-                if (required < configData.Voting.Standard_MinPlayersRequired)
-                    required = configData.Voting.Standard_MinPlayersRequired;
-                EventVotes.SetVotesToOpen(required);
-                timer.Once(60, () => GetRequiredVoteLoop());
-            }
-        }
-        public void StartEventVoteTimer()
-        {
-            VotingOpen = true;
-            eminterface.VoteTallyTimer = timer.Once((Event_Config.AutoEvent_Config.GameInterval * 60) - 30, () => EventVotes.ProcessEventVotes()); 
-        }
-        
-        private void CollectItemDetails()
-        {
-            foreach(var item in ItemManager.itemList)
-            {
-                if (!ItemNames.ContainsKey(item.itemid.ToString()))
-                    ItemNames.Add(item.itemid.ToString(), item.displayName.translated);
-            }
-        }
-        private void CollectClassList()
-        {
-            foreach(var kit in Event_Config.Classes)
-            {
-                GetKitItems(kit);
-            }
-        }
-        private void GetKitItems(string kit)
-        {
-            var contents = GetKitContents(kit);
-            if (!string.IsNullOrEmpty(contents))
-            {
-                ClassContents.Add(kit, contents);
-            }
-        }
-        
-        private object GetKits() => Kits?.Call("GetAllKits");
-        private object GetWeaponSets() => GunGame?.Call("GetWeaponSets");
-        private string GetKitContents(string kitname)
-        {
-            var contents = Kits?.Call("GetKitInfo", kitname);
-            if (contents != null && contents is JObject)
-            {
-                List<string> contentList = new List<string>();
-                JObject kitContents = contents as JObject;
-
-                JArray items = kitContents["items"] as JArray;
-                foreach (var itemEntry in items)
+                if (EventManager.BaseManager.joiningPlayers.Contains(player))
+                    DestroyAllUI(player);
+                else
                 {
-                    JObject item = itemEntry as JObject;
-                    string itemString = ItemNames[item["itemid"].ToString()];
-
-                    List<string> mods = new List<string>();
-                    foreach (var mod in item["mods"] as JArray)
-                        mods.Add(ItemNames[mod.ToString()]);
-
-                    if (mods.Count > 0)
-                        itemString += $" ({mods.ToSentence()})";
-
-                    contentList.Add(itemString);
+                    OpenMenu(player, new MenuArgs(0, MenuTab.Admin));
+                    CreateMenuPopup(player, "Event pre-start initiated");
                 }
-                return contentList.ToSentence();
+
+                EventManager.BaseManager.PrestartEvent();                
             }
-            return null;
         }
-        private object GetZones() => ZoneManager?.Call("GetZoneIDs");
-        private object GetZoneName(string zoneid) => ZoneManager?.Call("GetZoneName", zoneid);
-        private object GetSpawnfiles() => Spawns?.Call("GetSpawnfileNames");
-        private string GetRatio(int kills, int deaths)
+
+        [ConsoleCommand("emui.closeevent")]
+        private void ccmdCloseEvent(ConsoleSystem.Arg arg)
         {
-            var divisor = GCD(kills, deaths);
-            string k;
-            string d;
-            if (kills == 0)
-                k = "0";
-            else k = $"{kills / divisor}";
-            if (deaths == 0)
-                d = "0";
-            else d = $"{deaths / divisor}";
-            return $"{k} : {d}";
-        }
-        private int GCD(int a, int b)
-        {
-            return b == 0 ? a : GCD(b, a % b);
-        }
-        private void GetLeaderBoard(ref CuiElementContainer MainCont, string panel)
-        {
-            var leaders = EventManager.GameStatistics.Stats.OrderByDescending(key => key.Value.Score).Take(15);
-            int i = 1;
-            var posMin = 0.86f;
-            var posMax = 0.92f;
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color2}{msg("Name")}</color>", 16, $"0.525 {posMin}", $"0.775 {posMax}", TextAnchor.MiddleCenter);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color2}{msg("Rank")}</color>", 16, $"0.775 {posMin}", $"0.825 {posMax}", TextAnchor.MiddleCenter);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color2}{msg("K/D")}</color>", 16, $"0.825 {posMin}", $"0.9 {posMax}", TextAnchor.MiddleCenter);
-            EventManager.UI.CreateLabel(ref MainCont, UIPanel, "", $"{Color2}{msg("Wins")}</color>", 16, $"0.9 {posMin}", $"0.95 {posMax}", TextAnchor.MiddleCenter);
-            foreach (var entry in leaders)
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                AddLBEntry(ref MainCont, panel, entry.Value.Name, GetRatio(entry.Value.Kills, entry.Value.Deaths), entry.Value.GamesWon.ToString(), entry.Value.Rank.ToString(), i);
-                i++;
-            }            
+                CreateMenuPopup(player, $"Closed event {EventManager.BaseManager.Config.EventName} to new players");
+                EventManager.BaseManager.CloseEvent();
+                OpenMenu(player, new MenuArgs(0, MenuTab.Admin));
+            }
         }
         #endregion
 
-        #region External Calls        
-        public void CloseMap(BasePlayer player)
+        [ConsoleCommand("emui.editevent")]
+        private void ccmdEditEvent(ConsoleSystem.Arg arg)
         {
-            if (LustyMap)
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                LustyMap.Call("DisableMaps", player);
+                string eventName = CommandSafe(arg.GetString(0), true);
+
+                EventManager.EventConfig eventConfig = EventManager.Instance.Events.events[eventName];
+                eventConfig.Plugin = EventManager.Instance.GetPlugin(eventConfig.EventType);
+
+                if (eventConfig.Plugin != null)
+                {
+                    CreateMenuPopup(player, $"Editing event {eventName} ({eventConfig.EventType})");
+                    _eventCreators[player.userID] = eventConfig;
+                    OpenMenu(player, new MenuArgs(AdminTab.CreateEvent));
+                }
+                else CreateMenuPopup(player, $"The event plugin {eventConfig.EventType} is not loaded");
             }
         }
-        private void OpenMap(BasePlayer player)
+
+        [ConsoleCommand("emui.deleteevent")]
+        private void ccmdDeleteEvent(ConsoleSystem.Arg arg)
         {
-            if (LustyMap)
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
             {
-                LustyMap.Call("EnableMaps", player);
+                string eventName = CommandSafe(arg.GetString(0), true);
+
+                CreateMenuPopup(player, $"Deleted event {eventName}");
+
+                EventManager.Instance.Events.events.Remove(eventName);
+
+                EventManager.Instance.SaveEventData();
+
+                OpenMenu(player, new MenuArgs(AdminTab.None));
             }
-        }       
+        }
+
+        [ConsoleCommand("emui.closeselector")]
+        private void ccmdCloseSelector(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
+            {
+                OpenMenu(player, new MenuArgs(AdminTab.CreateEvent));
+            }
+        }
+
+        [ConsoleCommand("emui.fieldselector")]
+        private void ccmdOpenSelector(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
+            {
+                OpenMenu(player, new MenuArgs(new SelectorArgs(CommandSafe(arg.GetString(0), true), arg.GetString(1), arg.GetString(2), arg.GetBool(3)), 0));
+            }
+        }
+
+        [ConsoleCommand("emui.select")]
+        private void ccmdSelect(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, EventManager.ADMIN_PERMISSION))
+            {
+                EventManager.EventConfig eventConfig;
+                if (!_eventCreators.TryGetValue(player.userID, out eventConfig))
+                    return;
+
+                SetParameter(player, eventConfig, arg.GetString(1), CommandSafe(arg.GetString(4), true));
+
+                if (arg.GetBool(3))
+                    OpenMenu(player, new MenuArgs(new SelectorArgs(CommandSafe(arg.GetString(0), true), arg.GetString(1), arg.GetString(2), true), 0));
+
+                else OpenMenu(player, new MenuArgs(AdminTab.CreateEvent));
+            }
+        }
+
+        #region Command Helpers
+        private static string CommandSafe(string text, bool unpack = false) => unpack ? text.Replace("▊▊", " ") : text.Replace(" ", "▊▊");
+        #endregion
+        #endregion
+
+        #region UI
+        internal const string UI_MENU = "emui.menu";
+        internal const string UI_TIMER = "emui.timer";
+        internal const string UI_SCORES = "emui.scores";
+        internal const string UI_POPUP = "emui.popup";
+        internal const string UI_DEATH = "emui.death";
+        internal const string UI_RESPAWN = "emui.respawn";
+
+        internal static void DestroyAllUI(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, UI_MENU);
+            CuiHelper.DestroyUi(player, UI_DEATH);
+            CuiHelper.DestroyUi(player, UI_POPUP);
+            CuiHelper.DestroyUi(player, UI_RESPAWN);
+            CuiHelper.DestroyUi(player, UI_SCORES);
+            CuiHelper.DestroyUi(player, UI_TIMER);
+        }
+
+        public static class UI
+        {
+            public static CuiElementContainer Container(string panelName, string color, UI4 dimensions, bool useCursor = false, string parent = "Overlay")
+            {
+                CuiElementContainer container = new CuiElementContainer()
+                {
+                    {
+                        new CuiPanel
+                        {
+                            Image = { Color = color },
+                            RectTransform = { AnchorMin = dimensions.GetMin(), AnchorMax = dimensions.GetMax() },
+                            CursorEnabled = useCursor
+                        },
+                        new CuiElement().Parent = parent,
+                        panelName
+                    }
+                };
+                return container;
+            }
+
+
+            public static CuiElementContainer Popup(string panelName, string text, int size, UI4 dimensions, TextAnchor align = TextAnchor.MiddleCenter, string parent = "Overlay")
+            {
+                CuiElementContainer container = UI.Container(panelName, "0 0 0 0", dimensions, false);
+
+                UI.Label(container, panelName, text, size, UI4.Full, align);
+
+                return container;
+            }
+
+            public static void Panel(CuiElementContainer container, string panel, string color, UI4 dimensions)
+            {
+                container.Add(new CuiPanel
+                {
+                    Image = { Color = color },
+                    RectTransform = { AnchorMin = dimensions.GetMin(), AnchorMax = dimensions.GetMax() }
+                },
+                panel);
+            }
+
+            public static void Label(CuiElementContainer container, string panel, string text, int size, UI4 dimensions, TextAnchor align = TextAnchor.MiddleCenter)
+            {
+                container.Add(new CuiLabel
+                {
+                    Text = { FontSize = size, Align = align, Text = text },
+                    RectTransform = { AnchorMin = dimensions.GetMin(), AnchorMax = dimensions.GetMax() }
+                },
+                panel);
+            }
+
+            public static void Button(CuiElementContainer container, string panel, string color, string text, int size, UI4 dimensions, string command, TextAnchor align = TextAnchor.MiddleCenter)
+            {
+                container.Add(new CuiButton
+                {
+                    Button = { Color = color, Command = command, FadeIn = 0f },
+                    RectTransform = { AnchorMin = dimensions.GetMin(), AnchorMax = dimensions.GetMax() },
+                    Text = { Text = text, FontSize = size, Align = align }
+                },
+                panel);
+            }
+
+            public static void Input(CuiElementContainer container, string panel, string text, int size, string command, UI4 dimensions)
+            {
+                container.Add(new CuiElement
+                {
+                    Name = CuiHelper.GetGuid(),
+                    Parent = panel,
+                    Components =
+                    {
+                        new CuiInputFieldComponent
+                        {
+                            Align = TextAnchor.MiddleLeft,
+                            CharsLimit = 300,
+                            Command = command + text,
+                            FontSize = size,
+                            IsPassword = false,
+                            Text = text
+                        },
+                        new CuiRectTransformComponent {AnchorMin = dimensions.GetMin(), AnchorMax = dimensions.GetMax() }
+                    }
+                });
+            }
+
+            public static void Image(CuiElementContainer container, string panel, string png, UI4 dimensions)
+            {
+                container.Add(new CuiElement
+                {
+                    Name = CuiHelper.GetGuid(),
+                    Parent = panel,
+                    Components =
+                    {
+                        new CuiRawImageComponent {Png = png },
+                        new CuiRectTransformComponent { AnchorMin = dimensions.GetMin(), AnchorMax = dimensions.GetMax() }
+                    }
+                });
+            }
+
+            public static void Toggle(CuiElementContainer container, string panel, string boxColor, int fontSize, UI4 dimensions, string command, bool isOn)
+            {
+                UI.Panel(container, panel, boxColor, dimensions);
+
+                if (isOn)
+                    UI.Label(container, panel, "✔", fontSize, dimensions);
+
+                UI.Button(container, panel, "0 0 0 0", string.Empty, 0, dimensions, command);
+            }
+
+            public static string Color(string hexColor, float alpha)
+            {
+                if (hexColor.StartsWith("#"))
+                    hexColor = hexColor.TrimStart('#');
+
+                int red = int.Parse(hexColor.Substring(0, 2), NumberStyles.AllowHexSpecifier);
+                int green = int.Parse(hexColor.Substring(2, 2), NumberStyles.AllowHexSpecifier);
+                int blue = int.Parse(hexColor.Substring(4, 2), NumberStyles.AllowHexSpecifier);
+
+                return $"{(double)red / 255} {(double)green / 255} {(double)blue / 255} {alpha}";
+            }
+        }
+
+        public class UI4
+        {
+            public float xMin, yMin, xMax, yMax;
+
+            public UI4(float xMin, float yMin, float xMax, float yMax)
+            {
+                this.xMin = xMin;
+                this.yMin = yMin;
+                this.xMax = xMax;
+                this.yMax = yMax;
+            }
+
+            public string GetMin() => $"{xMin} {yMin}";
+
+            public string GetMax() => $"{xMax} {yMax}";
+
+            private static UI4 _full;
+
+            public static UI4 Full
+            {
+                get
+                {
+                    if (_full == null)
+                        _full = new UI4(0, 0, 1, 1);
+                    return _full;
+                }
+            }
+        }
         #endregion
 
         #region Config        
-        private ConfigData configData;
-        class Voting
+        public class ConfigData
         {
-            public bool Auto_AllowEventVoting { get; set; }
-            public bool Standard_AllowVoteToOpen { get; set; }
-            public float Standard_RequiredVoteFraction { get; set; }
-            public int Standard_MinPlayersRequired { get; set; }
-        }
-        class Colors
-        {
-            public string TextColor_Primary { get; set; }
-            public string TextColor_Secondary { get; set; }
-            public UIColor Background_Dark { get; set; }
-            public UIColor Background_Medium { get; set; }
-            public UIColor Background_Light { get; set; }
-            public UIColor Button_Standard { get; set; }
-            public UIColor Button_Accept { get; set; }
-            public UIColor Button_Inactive { get; set; }
-        }
-        class UIColor
-        {
-            public string Color { get; set; }
-            public float Alpha { get; set; }
-        }
-        class ConfigData
-        {
-            public Colors Colors { get; set; }
-            public Voting Voting { get; set; }
-        }
-        private void LoadVariables()
-        {
-            LoadConfigVariables();
-            SaveConfig();
-            Color1 = $"<color={configData.Colors.TextColor_Primary}>";
-            Color2 = $"<color={configData.Colors.TextColor_Secondary}>";
-        }
-        protected override void LoadDefaultConfig()
-        {
-            var config = new ConfigData
+            [JsonProperty(PropertyName = "Death screen skull image")]
+            public string DeathIcon { get; set; }
+
+            [JsonProperty(PropertyName = "Death screen background image")]
+            public string DeathBackground { get; set; }
+
+            [JsonProperty(PropertyName = "Menu Colors")]
+            public MenuColors Menu { get; set; }
+
+            [JsonProperty(PropertyName = "Scoreboard Colors")]
+            public ScoreboardColors Scoreboard { get; set; }
+
+            public class MenuColors
             {
-                Colors = new Colors
+                [JsonProperty(PropertyName = "Background Color")]
+                public UIColor Background { get; set; }
+
+                [JsonProperty(PropertyName = "Foreground Color")]
+                public UIColor Foreground { get; set; }
+
+                [JsonProperty(PropertyName = "Panel Color")]
+                public UIColor Panel { get; set; }                
+
+                [JsonProperty(PropertyName = "Button Color")]
+                public UIColor Button { get; set; }
+
+                [JsonProperty(PropertyName = "Highlight Color")]
+                public UIColor Highlight { get; set; }                
+            }
+
+            public class ScoreboardColors
+            {
+                [JsonProperty(PropertyName = "Background Color")]
+                public UIColor Background { get; set; }
+
+                [JsonProperty(PropertyName = "Foreground Color")]
+                public UIColor Foreground { get; set; }
+
+                [JsonProperty(PropertyName = "Panel Color")]
+                public UIColor Panel { get; set; }
+
+                [JsonProperty(PropertyName = "Highlight Color")]
+                public UIColor Highlight { get; set; }
+
+                [JsonProperty(PropertyName = "Screen Position")]
+                public UIPosition Position { get; set; }
+            }
+
+            public class UIColor
+            {
+                public string Hex { get; set; }
+                public float Alpha { get; set; }
+
+                [JsonIgnore]
+                private string _color;
+
+                [JsonIgnore]
+                public string Get
                 {
-                    Background_Dark = new UIColor { Color = "#2a2a2a", Alpha = 0.98f },
-                    Background_Medium = new UIColor { Color = "#373737", Alpha = 0.98f },
-                    Background_Light = new UIColor { Color = "#696969", Alpha = 0.3f },
-                    Button_Accept = new UIColor { Color = "#00cd00", Alpha = 0.9f },
-                    Button_Inactive = new UIColor { Color = "#a8a8a8", Alpha = 0.9f },
-                    Button_Standard = new UIColor { Color = "#2a2a2a", Alpha = 0.9f },
-                    TextColor_Primary = "#ce422b",
-                    TextColor_Secondary = "#939393"
+                    get
+                    {
+                        if (string.IsNullOrEmpty(_color))
+                            _color = EMInterface.UI.Color(Hex, Alpha);
+                        return _color;
+                    }
+                }
+            }
+
+            public class UIPosition
+            {                
+                [JsonProperty(PropertyName = "Center Position X (0.0 - 1.0)")]
+                public float CenterX { get; set; }
+
+                [JsonProperty(PropertyName = "Center Position Y (0.0 - 1.0)")]
+                public float CenterY { get; set; }
+
+                [JsonProperty(PropertyName = "Panel Width")]
+                public float Width { get; set; }
+
+                [JsonProperty(PropertyName = "Panel Height")]
+                public float Height { get; set; }
+
+                private UI4 _ui4;
+
+                public UI4 UI4
+                {
+                    get
+                    {
+                        if (_ui4 == null)
+                            _ui4 = new UI4(CenterX - (Width * 0.5f), CenterY - (Height * 0.5f), CenterX + (Width * 0.5f), CenterY + (Height * 0.5f));
+                        return _ui4;
+                    }
+                }
+            }
+
+            public Oxide.Core.VersionNumber Version { get; set; }
+        }
+
+        protected override void LoadConfig()
+        {
+            base.LoadConfig();
+            Configuration = Config.ReadObject<ConfigData>();
+
+            if (Configuration.Version < Version)
+                UpdateConfigValues();
+
+            Config.WriteObject(Configuration, true);
+        }
+
+        protected override void LoadDefaultConfig() => Configuration = GetBaseConfig();
+
+        private ConfigData GetBaseConfig()
+        {
+            return new ConfigData
+            {
+                DeathBackground = "",
+                DeathIcon = "https://www.rustedit.io/images/skullicon.png",
+                Menu = new ConfigData.MenuColors
+                {                    
+                    Background = new ConfigData.UIColor { Hex = "#232323", Alpha = 1f },
+                    Foreground = new ConfigData.UIColor { Hex = "#252526", Alpha = 1f },
+                    Panel = new ConfigData.UIColor { Hex = "#2d2d30", Alpha = 1f },
+                    Button = new ConfigData.UIColor { Hex = "#3e3e42", Alpha = 1f },
+                    Highlight = new ConfigData.UIColor { Hex = "#007acc", Alpha = 1f },
+                },     
+                Scoreboard = new ConfigData.ScoreboardColors
+                {
+                    Background = new ConfigData.UIColor { Hex = "#232323", Alpha = 0.8f },
+                    Foreground = new ConfigData.UIColor { Hex = "#252526", Alpha = 0.8f },
+                    Panel = new ConfigData.UIColor { Hex = "#2d2d30", Alpha = 0.8f },
+                    Highlight = new ConfigData.UIColor { Hex = "#007acc", Alpha = 0.8f },
+                    Position = new ConfigData.UIPosition { CenterX = 0.9325f, CenterY = 0.98f, Width = 0.125f, Height = 0.02f }
                 },
-                Voting = new Voting
-                {
-                    Auto_AllowEventVoting = true,
-                    Standard_AllowVoteToOpen = true,
-                    Standard_RequiredVoteFraction = 0.4f,
-                    Standard_MinPlayersRequired = 10
-                }
+                Version = Version
             };
-            SaveConfig(config);
         }
-        private void LoadConfigVariables() => configData = Config.ReadObject<ConfigData>();
-        void SaveConfig(ConfigData config) => Config.WriteObject(config, true);
-        #endregion
 
-        #region Data       
-        void SaveData()
-        {            
-            E_Conf.WriteObject(Event_Config);
-        }
-        void LoadData()
+        protected override void SaveConfig() => Config.WriteObject(Configuration, true);
+
+        private void UpdateConfigValues()
         {
-            try
-            {
-                Event_Config = E_Conf.ReadObject<EventConfig>();                
-            }
-            catch
-            {
-                Puts("Couldn't load event data, creating new datafile");
-                Event_Config = new EventConfig();
-            }
+            PrintWarning("Config update detected! Updating config values...");
+
+            Configuration.Version = Version;
+            PrintWarning("Config update completed!");
         }
-        #endregion
-
-        #region Commands
-        [ChatCommand("renameevent")]
-        void cmdRenameEvent(BasePlayer player, string command, string[] args)
-        {
-            if (!HasPerm(player)) return;
-
-            if (args.Length == 2)
-            {
-                if (EventManager._Open || EventManager._Started)
-                {
-                    SendReply(player, msg("You can not rename events whilst a game is open or is being played", player));
-                    return;
-                }
-                if (Event_Config.Event_List.ContainsKey(args[0]))
-                {
-                    if (!Event_Config.Event_List.ContainsKey(args[1]))
-                    {
-                        var config = Event_Config.Event_List[args[0]];
-                        Event_Config.Event_List.Remove(args[0]);
-                        Event_Config.Event_List.Add(args[1], config);
-                        if (EventManager._CurrentEventConfig == args[0])
-                            EventManager._Event = EventManager.DefaultConfig;
-                        SaveData();
-                        EventManager.ValidateAllEvents();
-                        SendReply(player, string.Format(msg("You have successfully renamed the event config '{0}' to '{1}'", player), args[0], args[1]));
-                        return;
-                    }
-                    else
-                    {
-                        SendReply(player, string.Format(msg("An event config with the name '{0}' already exists", player), args[1]));
-                        return;
-                    }
-                }
-                else
-                {
-                    SendReply(player, string.Format(msg("Could not find a event config with the name: {0}", player), args[0]));
-                    return;
-                }
-            }
-            SendReply(player, "/renameevent <currentname> <newname>");
-            
-        }
-        
-        [ConsoleCommand("event")]
-        void ccmdEvent(ConsoleSystem.Arg arg)
-        {
-            if (!HasAccess(arg)) return;
-            if (arg.Args == null || arg.Args.Length == 0)
-            {
-                SendReply(arg, msg("event open - Open a event"));
-                SendReply(arg, msg("event cancel - Cancel a event"));
-                SendReply(arg, msg("event start - Start a event"));
-                SendReply(arg, msg("event close - Close a event to new entries"));
-                SendReply(arg, msg("event end - End a event"));
-                SendReply(arg, msg("event launch - Launch auto events"));
-
-                SendReply(arg, msg("event battlefield - Toggle battlefield mode"));
-                SendReply(arg, msg("event classselector - Toggle the class selector"));
-                SendReply(arg, msg("event config - Load a premade event config"));
-                SendReply(arg, msg("event config list - Display all event config names"));
-                SendReply(arg, msg("event enemies XX - Set the enemy count for this event"));
-                SendReply(arg, msg("event game \"Game Name\" - Change event game"));
-                SendReply(arg, msg("event kit \"kitname\" - Change the event kit"));
-                SendReply(arg, msg("event minplayers XX - Set minimum required players"));
-                SendReply(arg, msg("event maxplayers XX - Set maximum players"));
-                SendReply(arg, msg("event rounds XX - Set the amount of rounds for this event"));
-                SendReply(arg, msg("event spawnfile \"filename\" - Change the event spawnfile"));
-                SendReply(arg, msg("event spawnfile2 \"filename\" - Change the second event spawnfile"));                
-                SendReply(arg, msg("event scorelimit XX - Set the event scorelimit"));
-                SendReply(arg, msg("event weaponset \"filename\" - Change the event weapon set (GunGame)"));
-                SendReply(arg, msg("event zone \"zoneID\" - Change the event zone"));
-                return;
-            }
-            if (arg.Args[0].ToLower() == "config")
-            {
-                if (arg.Args.Length == 2)
-                {
-                    if (arg.Args[1].ToLower() == "list")
-                    {
-                        if (Event_Config.Event_List.Count > 0)
-                        {
-                            SendReply(arg, msg("Config List:"));
-                            foreach (var conf in Event_Config.Event_List)
-                                SendReply(arg, conf.Key);
-                        }
-                        else SendReply(arg, msg("No configs have been saved"));
-                        return;
-                    }
-                    if (Event_Config.Event_List.ContainsKey(arg.Args[1]))
-                    {
-                        EventManager._Event = Event_Config.Event_List[arg.Args[1]];
-                        EventManager._CurrentEventConfig = arg.Args[1];
-
-                        SendReply(arg, string.Format(msg("{0} has been set as the current event config"), arg.Args[1]));
-                    }
-                    else SendReply(arg, string.Format(msg("{0} is not a valid event config"), arg.Args[1]));
-                }
-                else SendReply(arg, string.Format(msg("Current event config: {0}"), EventManager._CurrentEventConfig));
-                return;
-            }
-            if (arg.Args[0].ToLower() == "game")
-            {
-                if (arg.Args.Length > 1)
-                {
-                    object game = EventManager.SelectEvent(arg.Args[1]);
-                    if (game is string)
-                    {
-                        SendReply(arg, (string)game);
-                        return;
-                    }
-                    SendReply(arg, string.Format(msg("{0} is now the next Event game."), arg.Args[1]));
-                    return;
-                }
-                else SendReply(arg, string.Format(msg("{0} is the next Event game."), EventManager._Event.EventType));
-                return;
-            }
-            if (EventManager._Event == null || string.IsNullOrEmpty(EventManager._Event.EventType))
-            {
-                SendReply(arg, msg("You must set the event game first"));
-                return;
-            }
-            var _Event = EventManager._Event;
-            switch (arg.Args[0].ToLower())
-            {
-                case "cancel":
-                    EventManager._Launched = false;
-                    if (EventManager._Open) EventManager.CancelAutoEvent(msg("The event has been cancelled"));
-                    SendReply(arg, msg("The event has been cancelled"));
-                    return;
-                case "open":
-                    object open = EventManager.OpenEvent();
-                    if (open is string)
-                    {
-                        SendReply(arg, (string)open);
-                        return;
-                    }
-                    SendReply(arg, string.Format(msg("Event \"{0}\" is now open."), EventManager._Event.EventType));
-                    return;
-                case "start":
-                    object start = EventManager.StartEvent();
-                    if (start is string)
-                    {
-                        SendReply(arg, (string)start);
-                        return;
-                    }
-                    SendReply(arg, string.Format(msg("Event \"{0}\" has started."), EventManager._Event.EventType));
-                    return;
-                case "close":
-                    object close = EventManager.CloseEvent();
-                    if (close is string)
-                    {
-                        SendReply(arg, (string)close);
-                        return;
-                    }
-                    SendReply(arg, string.Format(msg("Event \"{0}\" is now closed for entries."), EventManager._Event.EventType));
-                    return;
-                case "end":
-                    object end = EventManager.EndEvent();
-                    if (end is string)
-                    {
-                        SendReply(arg, (string)end);
-                        return;
-                    }
-                    SendReply(arg, string.Format(msg("Event \"{0}\" has ended."), EventManager._Event.EventType));
-                    return;
-                case "minplayers":
-                    if (arg.Args.Length == 2)
-                    {
-                        int amount;
-                        if (int.TryParse(arg.Args[1], out amount))
-                        {
-                            _Event.MinimumPlayers = amount;
-                            SendReply(arg, string.Format(msg("Minimum Players for {0} is now {1}."), EventManager._Event.EventType, arg.Args[1]));
-                        }
-                        else SendReply(arg, msg("You must enter a valid number"));
-                    }
-                    else SendReply(arg, string.Format(msg("Minimum players: {0}"), _Event.MinimumPlayers));
-                    return;
-                case "maxplayers":
-                    if (arg.Args.Length == 2)
-                    {
-                        int amount;
-                        if (int.TryParse(arg.Args[1], out amount))
-                        {
-                            _Event.MaximumPlayers = amount;
-                            SendReply(arg, string.Format(msg("Maximum Players for {0} is now {1}."), EventManager._Event.EventType, arg.Args[1]));
-                        }
-                        else SendReply(arg, msg("You must enter a valid number"));
-                    }
-                    else SendReply(arg, string.Format(msg("Maximum players: {0}"), _Event.MinimumPlayers));
-                    return;
-                case "spawnfile":
-                    if (arg.Args.Length == 2)
-                    {
-                        if (EventManager._Open || EventManager._Started)
-                        {
-                            SendReply(arg, msg("You can not switch event spawn file whilst a game is underway"));
-                            return;
-                        }
-                        object spawnfile = EventManager.ValidateSpawnFile(arg.Args[1]);
-                        if (spawnfile is string)
-                        {
-                            SendReply(arg, (string)spawnfile);
-                            return;
-                        }
-                        _Event.Spawnfile = arg.Args[1];
-                        SendReply(arg, string.Format(msg("Spawnfile for {0} is now {1} ."), _Event.EventType, arg.Args[1]));
-                    }
-                    else SendReply(arg, string.Format(msg("Spawnfile: {0}"), _Event.Spawnfile));
-                    return;
-                case "spawnfile2":
-                    if (arg.Args.Length == 2)
-                    {
-                        if (EventManager._Open || EventManager._Started)
-                        {
-                            SendReply(arg, msg("You can not switch event spawn file whilst a game is underway"));
-                            return;
-                        }
-                        object spawnfile2 = EventManager.ValidateSpawnFile(arg.Args[1]);
-                        if (spawnfile2 is string)
-                        {
-                            SendReply(arg, (string)spawnfile2);
-                            return;
-                        }
-                        _Event.Spawnfile2 = arg.Args[1];
-                        SendReply(arg, string.Format(msg("Spawnfile 2 for {0} is now {1}."), _Event.EventType, arg.Args[1]));
-                    }
-                    else SendReply(arg, string.Format(msg("Second Spawnfile: {0}"), _Event.Spawnfile2));
-                    return;
-                case "kit":
-                    if (arg.Args.Length == 2)
-                    {
-                        object success = EventManager.ValidateKit(arg.Args[1]);
-                        if (success is string)
-                        {
-                            SendReply(arg, (string)success);
-                            return;
-                        }
-                        _Event.Kit = arg.Args[1];
-                        Interface.CallHook("OnSelectKit", _Event.Kit);
-                        SendReply(arg, string.Format(msg("The new Kit for {0} is now {1}"), _Event.EventType, arg.Args[1]));
-                    }
-                    else SendReply(arg, string.Format(msg("Kit: {0}"), _Event.Kit));
-                    return;
-                case "launch":
-                    object launch = EventManager.LaunchEvent();
-                    if (launch is string)
-                    {
-                        SendReply(arg, (string)launch);
-                        return;
-                    }
-                    SendReply(arg, string.Format(msg("Event \"{0}\" is now launched."), _Event.EventType));
-                    return;
-                case "scorelimit":
-                    if (string.IsNullOrEmpty(EventManager.EventGames[_Event.EventType].ScoreType))
-                    {
-                        SendReply(arg, msg("This event does not have a scoring system"));
-                        return;
-                    }
-                    if (arg.Args.Length == 2)
-                    {
-                        int amount;
-                        if (!int.TryParse(arg.Args[1], out amount))
-                        {
-                            SendReply(arg, msg("You must enter a valid number"));
-                            return;
-                        }
-                        _Event.ScoreLimit = amount;
-                        Interface.CallHook("SetScoreLimit", _Event.ScoreLimit);
-
-                        SendReply(arg, string.Format(msg("You have set the score limit for {0} to {1}"), _Event.EventType, amount));
-                    }
-                    else SendReply(arg, string.Format(msg("Scorelimit: {0}"), _Event.ScoreLimit));
-                    return;
-                case "weaponset":                    
-                    if (_Event.EventType != "GunGame")
-                    {
-                        SendReply(arg, msg("Only GunGame requires weapon sets"));
-                        return;
-                    }
-                    if (arg.Args.Length == 2)
-                    {
-                        if (EventManager._Open || EventManager._Started)
-                        {
-                            SendReply(arg, msg("You can not change weapon set whilst a game is underway"));
-                            return;
-                        }
-                        var sets = GetWeaponSets();
-                        if (sets != null)
-                        {
-                            if ((sets as string[]).Contains(arg.Args[1]))
-                            {
-                                _Event.WeaponSet = arg.Args[1];
-                                SendReply(arg, string.Format(msg("You have set the event weapon set to {0}"), arg.Args[1]));
-                                return;
-                            }
-                            else SendReply(arg, string.Format(msg("{0} is not a valid weapon set"), arg.Args[1]));
-                        }
-                        else SendReply(arg, msg("Unable to retrieve the weapon set list"));
-                    }
-                    else SendReply(arg, string.Format(msg("Weapon set: {0}"), _Event.WeaponSet));
-                    return;
-                case "zone":
-                    if (arg.Args.Length == 2)
-                    {
-                        if (EventManager._Open || EventManager._Started)
-                        {
-                            SendReply(arg, msg("You can not switch event zone whilst a game is underway"));
-                            return;
-                        }
-                        var success = EventManager.ValidateZoneID(arg.Args[1]);
-                        if (success is string)
-                        {
-                            SendReply(arg, (string)success);
-                            return;
-                        }
-                        _Event.ZoneID = arg.Args[1];
-                        SendReply(arg, string.Format(msg("You have set the event zone to {0}"), arg.Args[1]));
-                    }
-                    else SendReply(arg, string.Format(msg("Zone ID: {0}"), _Event.ZoneID));
-                    return;
-                case "classselector":
-                    if (EventManager.EventGames[_Event.EventType].CanUseClassSelector)
-                    {
-                        if (_Event.UseClassSelector)
-                        {
-                            _Event.UseClassSelector = false;
-                            SendReply(arg, msg("Disabled class selector"));
-                            return;
-                        }
-                        else
-                        {
-                            _Event.UseClassSelector = true;
-                            SendReply(arg, msg("Enabled class selector"));
-                            return;
-                        }
-                    }
-                    else SendReply(arg, msg("Class selector is unavailable for this event type"));
-                    return;
-                case "battlefield":
-                    if (EventManager.EventGames[_Event.EventType].CanPlayBattlefield)
-                    {
-                        if (_Event.GameMode == EventManager.GameMode.Normal)
-                        {
-                            _Event.GameMode = EventManager.GameMode.Battlefield;
-                            SendReply(arg, msg("Battlefield enabled"));
-                            return;
-                        }
-                        else
-                        {
-                            _Event.GameMode = EventManager.GameMode.Normal;
-                            SendReply(arg, msg("Battlefield disabled"));
-                            return;
-                        }
-                    }
-                    else SendReply(arg, msg("Battlefield is unavailable for this event type"));
-                    return;
-                case "enemies":
-                    if (!EventManager.EventGames[_Event.EventType].SpawnsEnemies)
-                    {
-                        SendReply(arg, msg("This event does not require enemies"));
-                        return;
-                    }
-                    if (arg.Args.Length == 2)
-                    {
-                        int enemies;
-                        if (int.TryParse(arg.Args[1], out enemies))
-                        {
-                            _Event.EnemiesToSpawn = enemies;
-                            Interface.CallHook("SetEnemyCount", _Event.EnemiesToSpawn);
-                            SendReply(arg, string.Format(msg("You have successfully set the enemy count to {0}"), enemies));
-                        }
-                        else SendReply(arg, msg("You must enter a valid number"));
-                    }
-                    else SendReply(arg, string.Format(msg("Enemies to spawn: {0}"), _Event.EnemiesToSpawn));
-                    return;
-                case "rounds":
-                    if (EventManager.EventGames[_Event.EventType].IsRoundBased)
-                    {
-                        SendReply(arg, msg("This event is not round based"));
-                        return;
-                    }
-                    if (arg.Args.Length == 2)
-                    {
-                        int rounds;
-                        if (int.TryParse(arg.Args[1], out rounds))
-                        {
-                            _Event.GameRounds = rounds;
-                            Interface.CallHook("SetGameRounds", _Event.GameRounds);
-                            SendReply(arg, string.Format(msg("You have successfully set the round limit to {0}"), rounds));
-                        }
-                        else SendReply(arg, msg("You must enter a valid number"));
-                    }
-                    else SendReply(arg, string.Format(msg("Rounds to play: {0}"), _Event.GameRounds));
-                    return;               
-                case "game":                    
-                    if (arg.Args.Length == 2)
-                    {
-                        if (EventManager._Open || EventManager._Started)
-                        {
-                            SendReply(arg, msg("You can not change game types when a game is underway"));
-                            return;
-                        }
-                        if (EventManager.EventGames.ContainsKey(arg.Args[1]))
-                        {
-                            _Event.EventType = arg.Args[1];
-                            SendReply(arg, string.Format(msg("{0} has been selected as the next game type"), arg.Args[1]));
-                        }
-                        else SendReply(arg, string.Format(msg("{0} is not a valid event game"), arg.Args[1]));
-                    }
-                    else SendReply(arg, string.Format(msg("Event game: {0}"), _Event.EventType));
-                    return;
-            }
-        }
-        #endregion
-
-        #region Authorization
-        bool HasAccess(ConsoleSystem.Arg arg) => arg.Connection == null || arg.Connection?.authLevel < 1;
-        bool HasPerm(BasePlayer player) => permission.UserHasPermission(player.UserIDString, "eminterface.admin") || player.IsAdmin;
         #endregion
 
         #region Localization
-        Dictionary<string, string> Messages = new Dictionary<string, string>
+        private static string Message(string key, ulong playerId = 0UL) => Instance.lang.GetMessage(key, Instance, playerId != 0UL ? playerId.ToString() : null);
+
+        private readonly Dictionary<string, string> Messages = new Dictionary<string, string>
         {
-            {"Event Manager", "Event Manager" },
-            {"Home", "Home" },
-            {"Statistics", "Statistics" },
-            {"Voting", "Voting" },
-            {"Change Class", "Change Class" },
-            {"Admin", "Admin" },
-            {"Rank", "Rank" },
-            {"K/D Ratio", "K/D Ratio" },
-            {"Games Played", "Games Played" },
-            {"Games Won", "Games Won" },
-            {"Games Lost", "Games Lost" },
-            {"Kills", "Kills" },
-            {"Deaths" ,"Deaths" },
-            {"Shots Fired" ,"Shots Fired" },
-            {"Helicopters Killed" ,"Helicopters Killed" },
-            {"You do not have any saved data" ,"You do not have any saved data" },
-            {"Event Status:" ,"Event Status:" },
-            {"Autoevent Status:" ,"Autoevent Status:" },
-            {"Current Game Scores" ,"Current Game Scores" },
-            {"Leave Event" ,"Leave Event" },
-            {"Join Event" ,"Join Event" },
-            {"Previous Game Scores" ,"Previous Game Scores" },
-            {"Voting requires auto events to be launched" ,"Voting requires auto events to be launched" },
-            {"Vote to open a new event" ,"Vote to open a new event" },
-            {"Total Votes : {0}{1}</color>" ,"Total Votes : {0}{1}</color>" },
-            {"Required Votes : {0}{1}</color>" ,"Required Votes : {0}{1}</color>" },
-            {"Voted" ,"Voted" },
-            {"Vote" ,"Vote" },
-            {"Vote for the next event to play!" ,"Vote for the next event to play!" },
-            {"Next" ,"Next" },
-            {"Back" ,"Back" },
-            {"There are no saved events" ,"There are no saved events" },
-            {"Global Statistics" ,"Global Statistics" },
-            {"Total Games Played" ,"Total Games Played" },
-            {"Total Player Kills" ,"Total Player Kills" },
-            {"Total Player Deaths" ,"Total Player Deaths" },
-            {"Total Event Players" ,"Total Event Players" },
-            {"Total Shots Fired" ,"Total Shots Fired" },
-            {"Total Flags Captured" ,"Total Flags Captured" },
-            {"Total Helicopters Killed" ,"Total Helicopters Killed" },
-            {"Leader Board" ,"Leader Board" },
-            {"ControlHelp" ,"The control menu allows you to customize and control events." },
-            {"Event Status" ,"Event Status" },
-            {"Open" ,"Open" },
-            {"Close" ,"Close" },
-            {"Start" , "Start" },
-            {"End" ,"End" },
-            {"Select a event config or event type to proceed" ,"Select a event config or event type to proceed" },
-            {"Event Config" ,"Event Config" },
-            {"Change" ,"Change" },
-            {"Event Type" , "Event Type"},
-            {"Gamemode" ,"Gamemode" },
-            {"Normal" ,"Normal" },
-            {"Battlefield" ,"Battlefield" },
-            {"Score Limit" , "Score Limit" },
-            {"Max Players" ,"Max Players" },
-            {"Weapon Set" , "Weapon Set"},
-            {"Kit" ,"Kit" },
-            {"Spawnfile" ,"Spawnfile" },
-            {"Second Spawnfile" ,"Second Spawnfile" },
-            {"Zone ID" ,"Zone ID" },
-            {"Enemies to spawn" , "Enemies to spawn"},
-            {"Rounds to play" ,"Rounds to play" },
-            {"Class Selector" ,"Class Selector" },
-            {"Disable Item Pickup" , "Disable Item Pickup"},
-            {"Close On Start" ,"Close On Start" },
-            {"Respawn Type" ,"Respawn Type" },
-            {"Enable" ,"Enable" },
-            {"Disable" ,"Disable" },
-            {"None" , "None"},
-            {"Timer" ,"Timer" },
-            {"Waves" ,"Waves" },
-            {"Respawn Timer (seconds)" , "Respawn Timer (seconds)" },
-            {"Add or remove kits from the class selector" ,"Add or remove kits from the class selector" },
-            {"Available Kits" ,"Available Kits" },
-            {"Available Classes" ,"Available Classes" },
-            {"Unable to find any kits" ,"Unable to find any kits" },
-            {"No classes have been added" ,"No classes have been added" },
-            {"Manage the auto event roster and settings" ,"Manage the auto event roster and settings" },
-            {"Auto-Event Settings" ,"Auto-Event Settings" },
-            {"Auto-Event Status" ,"Auto-Event Status" },
-            {"Next Event" ,"Next Event" },
-            {"Auto Cancel" ,"Auto Cancel" },
-            {"Game Interval (minutes)" ,"Game Interval (minutes)" },
-            {"Auto Cancel Timer (minutes)" ,"Auto Cancel Timer (minutes)" },
-            {"Increase" ,"Increase" },
-            {"Decrease" ,"Decrease" },
-            {"Randomize List" ,"Randomize List" },
-            {"Auto-Event Creator" ,"Auto-Event Creator" },
-            {"Join Timer (seconds)" ,"Join Timer (seconds)" },
-            {"Start Timer (seconds)" ,"Start Timer (seconds)" },
-            {"Time Limit (minutes)" , "Time Limit (minutes)"},
-            {"Save Config" ,"Save Config" },
-            {"Auto-Event Roster" ,"Auto-Event Roster" },
-            {"No auto events have been added" ,"No auto events have been added" },
-            {"CreateHelp" ,"Create a new event config by selecting your options here, start by selecting your game type" },
-            {"CreateHelp2" , "Change the available options to create a new event config. When you are done click 'Save Config'"},
-            {"Min Players" ,"Min Players" },
-            {"Remove created event configs using the remove button" ,"Remove created event configs using the remove button" },
-            {"No event configs found" ,"No event configs found" },
-            {"Classes" ,"Classes" },
-            {"Select a class from the options on the left" ,"Select a class from the options on the left" },
-            {"Currently Selected Class:" , "Currently Selected Class:" },
-            {"Class Selection" ,"Class Selection" },
-            {"Kit Contents:" ,"Kit Contents:" },
-            {"Select" ,"Select" },
-            {"weapon set" ,"weapon set" },
-            {"kit" ,"kit" },
-            {"Select a {0}" ,"Select a {0}" },
-            {"Unable to find any {0}s" ,"Unable to find any {0}s" },
-            {"Select a event type" ,"Select a event type" },
-            {"There are no registered events" ,"There are no registered events" },
-            {"Select a zone" ,"Select a zone" },
-            {"Unable to find any zones" ,"Unable to find any zones" },
-            {"Select a spawn file" ,"Select a spawn file" },
-            {"Unable to find any spawn files" ,"Unable to find any spawn files" },
-            {"Select a player to kick" ,"Select a player to kick" },
-            {"There is no event in progress" ,"There is no event in progress" },
-            {"Select a player to force join the event" ,"Select a player to force join the event" },
-            {"Select a event config from your list of preconfigured events" ,"Select a event config from your list of preconfigured events" },
-            {"You do not have any saved event configs" , "You do not have any saved event configs"},
-            {"You do not have any saved auto event configs" , "You do not have any saved auto event configs"},
-            {"Currently Selected Config:" , "Currently Selected Config:" },
-            {"Selected" ,"Selected" },
-            {"   Config: {0}\n   Type: {1}\n   Spawns: {2}   {3}\n   Kit: {4}{5}\n   Zone: {6}" ,"   Config: {0}\n   Type: {1}\n   Spawns: {2}   {3}\n   Kit: {4}{5}\n   Zone: {6}" },
-            {"Select a event config to use for the auto-event" ,"Select a event config to use for the auto-event" },
-            {"Config:" ,"Config:" },
-            {"Join Time:" ,"Join Time:" },
-            {"Start Time:" ,"Start Time:" },
-            {"Time Limit:" ,"Time Limit:" },
-            {"Remove" ,"Remove" },
-            {"Players" ,"Players" },
-            {"Leaders" ,"Leaders" },
-            {"Score" ,"Score" },
-            {"Closed" , "Closed"},
-            {" - Started" ," - Started" },
-            {" - Pending" ," - Pending" },
-            {" - Finished" , " - Finished"},
-            {"Launched" ,"Launched" },
-            {"Disabled" ,"Disabled" },
-            {"You have disabled the auto cancel timer for auto events" , "You have disabled the auto cancel timer for auto events"},
-            {"You have enabled the auto cancel timer for auto events" , "You have enabled the auto cancel timer for auto events"},
-            {"You can not switch event config whilst a game is underway" , "You can not switch event config whilst a game is underway"},
-            {"You have changed the event kit to:" ,"You have changed the event kit to:" },
-            {"You can not switch the game mode whilst a game is underway" ,"You can not switch the game mode whilst a game is underway" },
-            {"You can not switch event type whilst a game is underway" ,"You can not switch event type whilst a game is underway" },
-            {"You can not switch event spawn file whilst a game is underway" ,"You can not switch event spawn file whilst a game is underway" },
-            {"You can not switch event zone whilst a game is underway" ,"You can not switch event zone whilst a game is underway" },
-            {"You can not change respawn type during a match!" ,"You can not change respawn type during a match!" },
-            {"CreateSuccess" ,"You have successfully created a new event named: {0}{1}</color>\nYou can rename this event by typing in chat: {0}\n/renameevent <currentname> <newname></color>" },
-            {"You have reached the class limit" ,"You have reached the class limit" },
-            {"You have added the kit {0}' {1} ' </color> to the class list" ,"You have added the kit {0}' {1} ' </color> to the class list" },
-            {"You have removed the kit {0}' {1} '</color> from the class list" ,"You have removed the kit {0}' {1} '</color> from the class list" },
-            {"You need to select a event config" ,"You need to select a event config" },
-            {"You need to set a time limit of atleast 1 minute" ,"You need to set a time limit of atleast 1 minute" },
-            {"You have successfully added a new auto event" ,"You have successfully added a new auto event" },
-            {"You have kicked: {0}" ,"You have kicked: {0}" },
-            {"You have been kicked from the event" , "You have been kicked from the event"},
-            {"You have left the event" ,"You have left the event" },
-            {"You have joined the event" ,"You have joined the event" },
-            {"You have forced joined: {0}" ,"You have forced joined: {0}" },
-            {"You have been sent to the event" , "You have been sent to the event"},
-            {"You have removed the event config: {0}{1}</color>" ,"You have removed the event config: {0}{1}</color>" },
-            {"Error removing the event config: {0}{1}</color>" ,"Error removing the event config: {0}{1}</color>" },
-            {"You have successfully removed the event config from the roster" ,"You have successfully removed the event config from the roster" },
-            {"You have retracted your vote" ,"You have retracted your vote" },
-            {"You have voted to open an event" ,"You have voted to open an event" },
-            {"You have voted for Event {0}" ,"You have voted for Event {0}" },
-            {"You can not rename events whilst a game is open or is being played" ,"You can not rename events whilst a game is open or is being played" },
-            {"You have successfully renamed the event config '{0}' to '{1}'" ,"You have successfully renamed the event config '{0}' to '{1}'" },
-            {"An event config with the name '{0}' already exists" ,"An event config with the name '{0}' already exists" },
-            {"Could not find a event config with the name: {0}" ,"Could not find a event config with the name: {0}" },
-            {"event open - Open a event" ,"event open - Open a event" },
-            {"event cancel - Cancel a event" ,"event cancel - Cancel a event" },
-            {"event start - Start a event" ,"event start - Start a event" },
-            {"event close - Close a event to new entries" ,"event close - Close a event to new entries" },
-            {"event end - End a event" ,"event end - End a event" },
-            {"event launch - Launch auto events" ,"event launch - Launch auto events" },
-            {"event battlefield - Toggle battlefield mode" ,"event battlefield - Toggle battlefield mode" },
-            {"event classselector - Toggle the class selector" ,"event classselector - Toggle the class selector" },
-            {"event config - Load a premade event config" ,"event config - Load a premade event config" },
-            {"event config list - Display all event config names" ,"event config list - Display all event config names" },
-            {"event enemies XX - Set the enemy count for this event" ,"event enemies XX - Set the enemy count for this event" },
-            {"event game \"Game Name\" - Change event game" ,"event game \"Game Name\" - Change event game" },
-            {"event kit \"kitname\" - Change the event kit" ,"event kit \"kitname\" - Change the event kit" },
-            {"event minplayers XX - Set minimum required players (auto event)" ,"event minplayers XX - Set minimum required players" },
-            {"event maxplayers XX - Set maximum players (auto event)" ,"event maxplayers XX - Set maximum players" },
-            {"event rounds XX - Set the amount of rounds for this event" ,"event rounds XX - Set the amount of rounds for this event" },
-            {"event spawnfile \"filename\" - Change the event spawnfile" , "event spawnfile \"filename\" - Change the event spawnfile"},
-            {"event spawnfile2 \"filename\" - Change the second event spawnfile" ,"event spawnfile2 \"filename\" - Change the second event spawnfile" },
-            {"event scorelimit XX - Set the event scorelimit" ,"event scorelimit XX - Set the event scorelimit" },
-            {"event weaponset \"filename\" - Change the event weapon set (GunGame)" ,"event weaponset \"filename\" - Change the event weapon set (GunGame)" },
-            {"event zone \"zoneID\" - Change the event zone" ,"event zone \"zoneID\" - Change the event zone" },
-            {"{0} is now the next Event game." ,"{0} is now the next Event game." },
-            {"You must set the event game first" ,"You must set the event game first" },
-            {"The event has been cancelled" , "The event has been cancelled"},
-            {"Event \"{0}\" is now open." ,"Event \"{0}\" is now open." },
-            {"Event \"{0}\" has started." ,"Event \"{0}\" has started." },
-            {"Event \"{0}\" is now closed for entries." ,"Event \"{0}\" is now closed for entries." },
-            {"Event \"{0}\" has ended." ,"Event \"{0}\" has ended." },
-            {"Minimum Players for {0} is now {1}." ,"Minimum Players for {0} is now {1}." },
-            {"You must enter a valid number" ,"You must enter a valid number" },
-            {"Minimum players: {0}" ,"Minimum players: {0}" },
-            {"Maximum Players for {0} is now {1}." ,"Maximum Players for {0} is now {1}." },
-            {"Maximum players: {0}" ,"Maximum players: {0}" },
-            {"Spawnfile for {0} is now {1}.","Spawnfile for {0} is now {1}." },
-            {"Spawnfile: {0}","Spawnfile: {0}" },
-            {"Spawnfile 2 for {0} is now {1}.","Spawnfile 2 for {0} is now {1}." },
-            {"Second Spawnfile: {0}" ,"Second Spawnfile: {0}" },
-            {"The new Kit for {0} is now {1}" ,"The new Kit for {0} is now {1}" },
-            {"Kit: {0}" , "Kit: {0}"},
-            {"Event \"{0}\" is now launched." ,"Event \"{0}\" is now launched." },
-            {"This event does not have a scoring system" ,"This event does not have a scoring system" },
-            {"You have set the score limit for {0} to {1}" ,"You have set the score limit for {0} to {1}" },
-            {"Only GunGame requires weapon sets" ,"Only GunGame requires weapon sets" },
-            {"You can not change weapon set whilst a game is underway" ,"You can not change weapon set whilst a game is underway" },
-            {"You have set the event weapon set to {0}" ,"You have set the event weapon set to {0}" },
-            {"{0} is not a valid weapon set" ,"{0} is not a valid weapon set" },
-            {"Unable to retrieve the weapon set list" ,"Unable to retrieve the weapon set list" },
-            {"Weapon set: {0}" ,"Weapon set: {0}" },
-            {"You have set the event zone to {0}" ,"You have set the event zone to {0}" },
-            {"Zone ID: {0}" ,"Zone ID: {0}" },
-            {"Disabled class selector" ,"Disabled class selector" },
-            {"Enabled class selector" ,"Enabled class selector" },
-            {"Class selector is unavailable for this event type" ,"Class selector is unavailable for this event type" },
-            {"Battlefield enabled" ,"Battlefield enabled" },
-            {"Battlefield disabled" , "Battlefield disabled"},
-            {"Battlefield is unavailable for this event type" ,"Battlefield is unavailable for this event type" },
-            {"This event does not require enemies" ,"This event does not require enemies" },
-            {"You have successfully set the enemy count to {0}" ,"You have successfully set the enemy count to {0}" },
-            {"Enemies to spawn: {0}" ,"Enemies to spawn: {0}" },
-            { "This event is not round based" , "This event is not round based" },
-            {"You have successfully set the round limit to {0}" , "You have successfully set the round limit to {0}"},
-            {"Rounds to play: {0}" ,"Rounds to play: {0}" },
-            {"Config List:" ,"Config List:" },
-            {"No configs have been saved" ,"No configs have been saved" },
-            {"{0} has been set as the current event config" ,"{0} has been set as the current event config" },
-            {"{0} is not a valid event config" ,"{0} is not a valid event config" },
-            {"Current event config: {0}" ,"Current event config: {0}" },
-            {"You can not change game types when a game is underway" ,"You can not change game types when a game is underway" },
-            {"{0} has been selected as the next game type" ,"{0} has been selected as the next game type" },
-            {"{0} is not a valid event game" ,"{0} is not a valid event game" },
-            {"Event game: {0}" ,"Event game: {0}" },
-            {"You have changed the game mode to:", "You have changed the game mode to:" },
-            {"You have changed the weapon set to:", "You have changed the weapon set to:" },
-            {"You have changed the event type to:", "You have changed the event type to:" },
-            {"You have changed the event spawn file to:", "You have changed the event spawn file to:" },
-            {"You have changed the second spawn file to:", "You have changed the second spawn file to:" },
-            {"You have changed the event zone to:", "You have changed the event zone to:" },
-            {"Name", "Name" },
-            {"K/D", "K/D" },
-            {"Wins", "Wins" },
-            {"Spawn Type", "Spawn Type" },
-            {"Consecutive","Consecutive" },
-            {"Random","Random" },
-            {"Switch Class", "Switch Class" },
-            {"endingEvent", "The event is now ending" }
+            ["UI.Title"] = "Event Manager",
+            ["UI.Statistics.Title"] = "Event Statistics",
+
+            ["UI.Event.Current"] = "Current Event",
+            ["UI.Event.NoEvent"] = "No event in progress",
+            ["UI.Event.CurrentScores"] = "Scoreboard",
+            ["UI.Event.NoScoresRecorded"] = "No scores have been recorded yet",
+            ["UI.Event.TeamScore"] = "Team Scores",
+            ["UI.Event.Previous"] = "Previous Event Scores",
+            ["UI.Event.NoPrevious"] = "No event has been played yet",
+
+            ["UI.Event.Name"] = "Name",
+            ["UI.Event.Type"] = "Type",
+            ["UI.Event.Status"] = "Status",
+            ["UI.Event.Players"] = "Players",
+            ["UI.Players.Format"] = "{0} / {1} ({2} joining)",
+            ["UI.Event.TimeLimit"] = "Time Limit",
+            ["UI.Event.ScoreLimit"] = "Score Limit",
+            ["UI.Event.WinReward"] = "Win Reward",
+            ["UI.Event.KillReward"] = "Kill Reward",
+            ["UI.Event.HeadshotReward"] = "Headshot Reward",
+
+            ["UI.Event.Leave"] = "Leave Event",
+            ["UI.Event.Enter"] = "Enter Event",
+            ["UI.Popup.EnterEvent"] = "You have entered the event",
+            ["UI.Popup.LeaveEvent"] = "You have left the event",
+
+            ["UI.Reward.Format"] = "{0} {1}",
+            ["UI.Reward.Scrap"] = "Scrap",
+            ["UI.Reward.Economics"] = "Coins",
+            ["UI.Reward.ServerRewards"] = "RP",
+
+            ["UI.Admin.Title"] = "Admin Options",
+            ["UI.Admin.Start"] = "Start Event",
+            ["UI.Admin.Close"] = "Close Event",
+            ["UI.Admin.End"] = "End Event",
+            ["UI.Admin.Kick"] = "Kick Player",
+            ["UI.Admin.Open"] = "Open Event",
+            ["UI.Admin.Edit"] = "Edit Event",
+            ["UI.Admin.Create"] = "Create Event",
+            ["UI.Admin.Delete"] = "Delete Event",
+
+            ["UI.Menu.Admin"] = "Admin",
+            ["UI.Menu.Statistics"] = "Statistics",
+            ["UI.Menu.Event"] = "Event",
+
+            ["UI.LeaveEvent"] = "Leave Event",
+            ["UI.JoinEvent"] = "Join Event",
+
+            ["UI.Statistics.Personal"] = "Personal Statistics",
+            ["UI.Statistics.Global"] = "Global Statistics",
+            ["UI.Statistics.Leaders"] = "Leader Boards",
+            ["UI.NoStatisticsSaved"] = "No statistics have been recorded yet",
+
+            ["UI.Rank"] = "Rank",
+            ["UI.GamesPlayed"] = "Games Played",
+
+            ["UI.Next"] = "Next",
+            ["UI.Back"] = "Back",
+
+            ["UI.Player"] = "Player",
+            ["UI.Score"] = "Score",
+            ["UI.Kills"] = "Kills",
+            ["UI.Deaths"] = "Deaths",
+            ["UI.Assists"] = "Kill Assists",
+            ["UI.Headshots"] = "Headshots",
+            ["UI.Melee"] = "Melee Kills",
+            ["UI.Won"] = "Games Won",
+            ["UI.Lost"] = "Games Lost",
+            ["UI.Played"] = "Games Played",
+
+            ["UI.Totals"] = "Total {0}",
+
+            ["UI.Return"] = "Return",
+
+            ["UI.Death.Leave"] = "Leave",
+            ["UI.Death.Respawn"] = "Respawn",
+            ["UI.Death.Respawn.Time"] = "Respawn ({0})",
+            ["UI.Death.AutoRespawn"] = "Auto-Respawn",
+            ["UI.Death.Class"] = "Change Class",
+
+            ["UI.Score.TeamA"] = "Team A : {0}",
+            ["UI.Score.TeamB"] = "Team B : {0}",
         };
         #endregion
     }

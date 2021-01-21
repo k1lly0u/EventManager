@@ -1,1067 +1,794 @@
 ﻿// Requires: EventManager
-using System.Collections.Generic;
-using System.Reflection;
-using UnityEngine;
-using Oxide.Core;
-using Oxide.Core.Plugins;
+using Newtonsoft.Json;
 using Oxide.Game.Rust.Cui;
-using System.Linq;
-using Rust;
+using Oxide.Plugins.EventManagerEx;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UI = Oxide.Plugins.EMInterface.UI;
+using UI4 = Oxide.Plugins.EMInterface.UI4;
 
 namespace Oxide.Plugins
 {
-    [Info("ChopperSurvival", "k1lly0u", "0.2.82", ResourceId = 1590)]
-    class ChopperSurvival : RustPlugin
-    {        
-        [PluginReference] EventManager EventManager;
-        [PluginReference] Plugin Spawns;
+    [Info("ChopperSurvival", "k1lly0u", "3.0.0"), Description("Chopper survival event mode for EventManager")]
+    class ChopperSurvival : RustPlugin, IEventPlugin
+    {
+        private const string HELICOPTER_PREFAB = "assets/prefabs/npc/patrol helicopter/patrolhelicopter.prefab";
 
-        static private FieldInfo _spawnTime = typeof(PatrolHelicopterAI).GetField("spawnTime", (BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic));
-
-        static ChopperSurvival instance;
-
-        private bool usingCS;
-        private bool hasStarted;
-        private bool isEnding;
-
-        private List<CSPlayer> CSPlayers = new List<CSPlayer>();
-        private List<Timer> GameTimers = new List<Timer>();
-        private List<CSHelicopter> CSHelicopters = new List<CSHelicopter>();
-
-        private float adjHeliHealth;
-        private float adjHeliBulletDamage;
-        private float adjMainRotorHealth;
-        private float adjEngineHealth;
-        private float adjTailRotorHealth;
-        private float adjHeliAccuracy;
-
-        private int gameRounds;
-        private int enemyCount;
-        private int currentWave;
-
-        private string spawnFile;
-        private string kit;
-
-        const string heliExplosion = "assets/prefabs/npc/patrol helicopter/effects/heli_explosion.prefab";
-
-        #region Classes
-        class CSPlayer : MonoBehaviour
+        #region Oxide Hooks
+        private void OnServerInitialized()
         {
-            public BasePlayer player;
-            public int deaths;
-            public int points;
-            public List<string> openUi;
+            EventManager.RegisterEvent(Title, this);
 
-            void Awake()
-            {
-                player = GetComponent<BasePlayer>();
-                enabled = false;
-                deaths = 0;
-                points = 0;
-                openUi = new List<string>();
-            }                        
-            void OnDestroy()
-            {
-                DestroyAllUI();
-            }
-            public void AddUi(CuiElementContainer container, string name)
-            {
-                openUi.Add(name);
-                CuiHelper.AddUi(player, container);
-            }
-            public void DestroyUi(string name)
-            {
-                CuiHelper.DestroyUi(player, name);
-                if (openUi.Contains(name))
-                    openUi.Remove(name);
-            }
-            public void DestroyAllUI()
-            {
-                foreach (var element in openUi)
-                    CuiHelper.DestroyUi(player, element);
-                openUi.Clear();
-            }
-        } 
-       
-        class CSHelicopter : MonoBehaviour
+            GetMessage = Message;
+        }
+
+        protected override void LoadDefaultMessages() => lang.RegisterMessages(Messages, this);
+
+        private void OnEntityTakeDamage(BaseHelicopter baseHelicopter, HitInfo hitInfo)
         {
-            public BaseHelicopter helicopter;
-            private PatrolHelicopterAI ai;
-            private Vector3 targetPos;
-            private bool isDieing;
+            if (baseHelicopter == null || hitInfo == null)
+                return;
 
-            public Dictionary<StatType, StatMonitor> stats;
-            public string heliId;            
-
-            void Awake()
+            if (baseHelicopter.GetComponent<EventHelicopter>())
             {
-                helicopter = GetComponent<BaseHelicopter>();
-                ai = GetComponent<PatrolHelicopterAI>();
-                heliId = CuiHelper.GetGuid();
-                isDieing = false;
-                enabled = false;
-            }
-            void OnDestroy()
-            {
-                enabled = false;  
-                instance.DestroyHealthUI(heliId);
-                CancelInvoke();                
-            }
-            public void SpawnHelicopter(Vector3 targetPos, float rotor, float tail, float engine, float body, float damage)
-            {
-                this.targetPos = targetPos;
-                stats = new Dictionary<StatType, StatMonitor>
-                {
-                    {StatType.Body, new StatMonitor {max = body, value = body } },
-                    {StatType.Damage, new StatMonitor {max = damage, value = damage } },
-                    {StatType.Engine, new StatMonitor {max = engine, value = engine } },
-                    {StatType.Rotor, new StatMonitor {max = rotor, value = rotor } },
-                    {StatType.Tail, new StatMonitor {max = tail, value = tail } }
-                };
-                _spawnTime.SetValue(ai, UnityEngine.Time.realtimeSinceStartup * 10);
-                var spawnPos = FindSpawnPosition(targetPos);
-                helicopter.transform.position = spawnPos;                
-                enabled = true;
-                CheckDistance();
-            }
-            
-            public int TakeDamage(HitInfo info)
-            {
-                if (isDieing)                
-                    return 0;
-
-                int pointValue = 0;
-                float damage = info.damageTypes.Total();
-                bool hitWeakSpot = false;
-
-                for (int i = 0; i < helicopter.weakspots.Length; i++)
-                {
-                    BaseHelicopter.weakspot _weakspot = helicopter.weakspots[i];
-                    string[] strArrays = _weakspot.bonenames;
-                    for (int j = 0; j < strArrays.Length; j++)
-                    {
-                        string str = strArrays[j];
-                        if (info.HitBone == StringPool.Get(str))
-                        {
-                            switch (str)
-                            {
-                                case "engine_col":
-                                    hitWeakSpot = true;
-                                    stats[StatType.Engine].DealDamage(damage);
-                                    pointValue = instance.configData.Scoring.HeliHitPoints;
-                                    break;
-                                case "tail_rotor_col":
-                                    hitWeakSpot = true;
-                                    stats[StatType.Tail].DealDamage(damage);
-                                    pointValue = instance.configData.Scoring.RotorHitPoints;
-                                    if (stats[StatType.Tail].value < 25)
-                                        helicopter.weakspots[i].WeakspotDestroyed();
-                                    break;
-                                case "main_rotor_col":
-                                    hitWeakSpot = true;
-                                    stats[StatType.Rotor].DealDamage(damage);
-                                    pointValue = instance.configData.Scoring.RotorHitPoints;
-                                    if (stats[StatType.Rotor].value < 25)
-                                        helicopter.weakspots[i].WeakspotDestroyed();
-                                    break;
-                            }
-                        }
-                    }
-                }
-                if (!hitWeakSpot)
-                {
-                    pointValue = 1;
-                    stats[StatType.Body].DealDamage(damage);
-                }
-                if (stats[StatType.Body].value < 5 || stats[StatType.Engine].value < 5 || (stats[StatType.Tail].value < 5 && stats[StatType.Rotor].value < 5))
-                {
-                    KillHelicopter(true);
-                    isDieing = true;
-                    if (info?.InitiatorPlayer != null)
-                        instance.EventManager.AddStats(info.InitiatorPlayer, EventManager.StatType.Choppers);                    
-                }
-                return pointValue;
-            }
-            public void KillHelicopter(bool dropGibs)
-            {                
-                ai.ExitCurrentState();                             
-                instance.DieInstantly(helicopter);                            
-            }
-            private void CheckDistance()
-            {
-                if (isDieing)
-                    return;
-                var currentPos = base.transform.position;
-                if (currentPos.y < TerrainMeta.HeightMap.GetHeight(currentPos))
-                {
-                    KillHelicopter(false);
-                    return;
-                }
-                if (targetPos != null)
-                {
-                    ai.SetTargetDestination(targetPos + new Vector3(0.0f, instance.configData.HelicopterSettings.DestinationHeightAdjust, 0.0f));
-                    if (Vector3Ex.Distance2D(currentPos, targetPos) < 60)
-                    {
-                        if (instance.configData.HelicopterSettings.UseRockets)
-                        {
-                            if (UnityEngine.Random.Range(1, 3) == 2)
-                                ai.State_Strafe_Think(0);
-                        }
-                        else ai.State_Orbit_Think(40f);
-                    }
-                    else
-                        ai.State_Move_Enter(targetPos + new Vector3(0.0f, instance.configData.HelicopterSettings.DestinationHeightAdjust, 0.0f));
-                }
-                Invoke("CheckDistance", instance.configData.HelicopterSettings.CheckDistanceTimer);
-            }
-            private Vector3 FindSpawnPosition(Vector3 arenaPos)
-            {
-                float x = 0;
-                float y = 0;
-                float angleRadians = 0;
-                Vector2 circleVector;
-                angleRadians = UnityEngine.Random.Range(0, 180) * Mathf.PI / 180.0f;
-                x = instance.configData.HelicopterSettings.SpawnDistance * Mathf.Cos(angleRadians);
-                y = instance.configData.HelicopterSettings.SpawnDistance * Mathf.Sin(angleRadians);
-                circleVector = new Vector2(x, y);
-                Vector3 finalPos = new Vector3(circleVector.x + arenaPos.x, TerrainMeta.HeightMap.GetHeight(new Vector3(circleVector.x + arenaPos.x, 0, circleVector.y + arenaPos.z)), circleVector.y + arenaPos.z);
-                if (finalPos.y < 1) finalPos.y = 5;
-                finalPos.y = finalPos.y + 50;
-                return finalPos;
+                if (EventManager.GetUser(hitInfo.InitiatorPlayer) == null)
+                    EventManager.ClearDamage(hitInfo);
             }            
         }
-        enum StatType
-        {
-            Rotor, Tail, Engine, Body, Damage
-        }
-        public class StatMonitor
-        {
-            public float max;
-            public float value;
-            public void DealDamage(float amount) => value -= amount;
-        }       
-        #endregion
 
-        #region UI Elements
-        private void UpdateScores()
+        private void Unload()
         {
-            if (usingCS && hasStarted && configData.EventSettings.ShowScoreboard)
-            {
-                var sortedList = CSPlayers.OrderByDescending(pair => pair.points).ToList();
-                var scoreList = new Dictionary<ulong, EventManager.Scoreboard>();
-                foreach (var entry in sortedList)
-                {
-                    if (scoreList.ContainsKey(entry.player.userID)) continue;
-                    scoreList.Add(entry.player.userID, new EventManager.Scoreboard { Name = entry.player.displayName, Position = sortedList.IndexOf(entry), Score = entry.points });
-                }
-                EventManager.UpdateScoreboard(new EventManager.ScoreData { Additional = null, ScoreType = "Points", Scores = scoreList });
-            }
-        }
-        private CuiElementContainer CreateHealthIndicator(CSHelicopter heli, int count)
-        {            
-            var panelName = heli.heliId;
-            var pos = CalcHealthPos(count);
-            var element = EventManager.UI.CreateElementContainer(panelName, "0.1 0.1 0.1 0.7", $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", false, "Hud");
+            EventHelicopter[] eventHelicopters = UnityEngine.Object.FindObjectsOfType<EventHelicopter>();
+            for (int i = 0; i < eventHelicopters.Length; i++)
+                UnityEngine.Object.Destroy(eventHelicopters[i]);
 
-            CreateHealthElement(ref element, panelName, "Body Health", heli.stats[StatType.Body].max, heli.stats[StatType.Body].value, 0.75f);
-            CreateHealthElement(ref element, panelName, "Main Rotor", heli.stats[StatType.Rotor].max, heli.stats[StatType.Rotor].value, 0.5f);
-            CreateHealthElement(ref element, panelName, "Tail Rotor", heli.stats[StatType.Tail].max, heli.stats[StatType.Tail].value, 0.25f);
-            CreateHealthElement(ref element, panelName, "Engine Health", heli.stats[StatType.Engine].max, heli.stats[StatType.Engine].value, 0f);
-                       
-            return element;
-        }
-        private void CreateHealthElement(ref CuiElementContainer element, string panelName, string name, float maxHealth, float currentHealth, float minY)
-        {
-            var percent = System.Convert.ToDouble((float)currentHealth / (float)maxHealth);
-            var yMax = 0.98 * percent;
-            string color = "0.2 0.6 0.2 0.9";
-            if (percent <= 0.5)
-                color = "1 0.5 0 0.9";
-            if (percent <= 0.15)
-                color = "0.698 0.13 0.13 0.9";
-            EventManager.UI.CreatePanel(ref element, panelName, color, $"0.01 {minY + 0.005}", $"{yMax} {minY + 0.24}");
-            EventManager.UI.CreateLabel(ref element, panelName, "", name, 8, $"0 {minY}", $"1 {minY + 0.25}");
-        }
-        private void DestroyHealthUI(string heliId)
-        {
-            foreach (var entry in CSPlayers)
-                entry.DestroyUi(heliId);
-        }
-        private void DestroyAllHealthUI(BasePlayer player)
-        {
-            var csPlayer = player.GetComponent<CSPlayer>();
-            if (csPlayer != null)            
-                csPlayer.DestroyAllUI();
-            else
-            {
-                foreach (var heli in CSHelicopters)
-                    CuiHelper.DestroyUi(player, heli.heliId);
-            }
-        }        
-        private void RefreshHealthUI(CSHelicopter heli)
-        {
-            if (!heli) return;
-            if (configData.EventSettings.ShowHeliHealthUI)
-            {
-                foreach (var entry in CSPlayers)
-                {
-                    entry.DestroyUi(heli.heliId);
-                    entry.AddUi(CreateHealthIndicator(heli, CSHelicopters.IndexOf(heli)), heli.heliId);
-                }
-            }
-        }
-        private void RefreshPlayerHealthUI(CSPlayer player)
-        {
-            if (player == null) return;
-            if (configData.EventSettings.ShowHeliHealthUI)
-            {
-                foreach (var heli in CSHelicopters)
-                {
-                    player.DestroyUi(heli.heliId);
-                    player.AddUi(CreateHealthIndicator(heli, CSHelicopters.IndexOf(heli)), heli.heliId);
-                }
-            }
-        }        
-        private float[] CalcHealthPos(int number)
-        {
-            Vector2 position = new Vector2(0.01f, 0.9f);
-            Vector2 dimensions = new Vector2(0.07f, 0.08f);
-            float offsetY = 0;
-            float offsetX = 0;
-            if (number >= 0 && number < 3)
-            {
-                offsetX = (0.0033f + dimensions.x) * number;
-            }
-            if (number > 2 && number < 6)
-            {
-                offsetX = (0.0033f + dimensions.x) * (number - 3);
-                offsetY = (-0.005f - dimensions.y) * 1;
-            }
-            if (number > 5 && number < 9)
-            {
-                offsetX = (0.0033f + dimensions.x) * (number - 6);
-                offsetY = (-0.005f - dimensions.y) * 2;
-            }
-            if (number > 8 && number < 12)
-            {
-                offsetX = (0.0033f + dimensions.x) * (number - 9);
-                offsetY = (-0.005f - dimensions.y) * 3;
-            }
-            if (number > 11 && number < 15)
-            {
-                offsetX = (0.0033f + dimensions.x) * (number - 12);
-                offsetY = (-0.005f - dimensions.y) * 4;
-            }
+            if (!EventManager.IsUnloading)
+                EventManager.UnregisterEvent(Title);
 
-            Vector2 offset = new Vector2(offsetX, offsetY);
-            Vector2 posMin = position + offset;
-            Vector2 posMax = posMin + dimensions;
-            return new float[] { posMin.x, posMin.y, posMax.x, posMax.y };
+            Configuration = null;
         }
         #endregion
 
-        #region Oxide hooks
-        void OnServerInitialized()
-        {
-            usingCS = false;
-            hasStarted = false;
-                        
-            LoadVariables();
-            RegisterMessages();
+        #region Event Checks
+        public bool InitializeEvent(EventManager.EventConfig config) => EventManager.InitializeEvent<ChopperSurvivalEvent>(this, config);
 
-            instance = this;
-            kit = configData.EventSettings.DefaultKit;
-            spawnFile = configData.EventSettings.DefaultSpawnfile;
-        }    
-        void Unload()
+        public bool CanUseClassSelector => true;
+
+        public bool RequireTimeLimit => false;
+
+        public bool RequireScoreLimit => false;
+
+        public bool UseScoreLimit => false;
+
+        public bool UseTimeLimit => false;
+
+        public bool IsTeamEvent => false;
+
+        public void FormatScoreEntry(EventManager.ScoreEntry scoreEntry, ulong langUserId, out string score1, out string score2)
         {
-            foreach (var eventPlayer in CSPlayers)
-                eventPlayer.DestroyAllUI();
-            if (usingCS && hasStarted)                                    
-                EventManager.EndEvent(); 
-			else DestroyEvent();
-        }        
-		void OnEntityTakeDamage(BaseCombatEntity entity, HitInfo hitInfo)
+            score1 = string.Empty;
+            score2 = string.Format(Message("Score.HitPoints", langUserId), scoreEntry.value1);
+        }
+
+        public List<EventManager.EventParameter> AdditionalParameters { get; } = new List<EventManager.EventParameter>
         {
-			if (usingCS && hasStarted && entity != null && !isEnding)
+            new EventManager.EventParameter
             {
-                var attacker = hitInfo.InitiatorPlayer;
-                if (attacker == null) return;
-                var helicopter = entity.GetComponent<CSHelicopter>();
-
-                if (helicopter != null && !attacker.GetComponent<CSPlayer>())
-				{
-                    hitInfo.damageTypes = new DamageTypeList();
-                    hitInfo.HitEntity = null;
-                    hitInfo.HitMaterial = 0;
-                    hitInfo.PointStart = Vector3.zero;
-                    return;
-				}
-                if (attacker.GetComponent<CSPlayer>())
-                {
-                    if (entity is BasePlayer)
-                    {
-                        if (entity.ToPlayer() == null || hitInfo == null) return;
-                        if (entity.ToPlayer().userID != hitInfo.Initiator.ToPlayer().userID)
-                        {
-                            if (entity.GetComponent<CSPlayer>())
-                            {
-                                hitInfo.damageTypes.ScaleAll(configData.PlayerSettings.FFDamageScale);
-                                SendReply(attacker, MSG("fFire"));
-                            }
-                        }
-                    }
-                    if (helicopter != null)
-                    {
-                        int points = entity.GetComponent<CSHelicopter>().TakeDamage(hitInfo);
-                        RefreshHealthUI(helicopter);
-                        hitInfo.damageTypes = new DamageTypeList();
-                        hitInfo.HitEntity = null;
-                        hitInfo.HitMaterial = 0;
-                        hitInfo.PointStart = Vector3.zero;
-                        attacker.GetComponent<CSPlayer>().points += points;
-                    }
-                }
-			}
-        } 		
-        void OnEntitySpawned(BaseNetworkable entity)
-        {
-            if (usingCS && hasStarted)
+                DataType = "int",
+                Field = "playerLives",
+                Input = EventManager.EventParameter.InputType.InputField,                
+                IsRequired = true,
+                DefaultValue = 1,
+                Name = "Player Lives"
+            },
+            new EventManager.EventParameter
             {
-                if (entity is BaseEntity)
-                {
-                    var entityName = entity.ShortPrefabName;
-
-                    if (entityName.Contains("napalm"))
-                    {
-                        if (!configData.HelicopterSettings.UseRockets)
-                        {
-                            entity.Kill();
-                        }
-                    }
-
-                    if (entityName.Contains("servergibs_patrolhelicopter"))
-                        entity.Kill();
-                }
+                DataType = "int",
+                Field = "rounds",
+                Input = EventManager.EventParameter.InputType.InputField,
+                IsRequired = true,
+                DefaultValue = 5,
+                Name = "Rounds"
+            },
+            new EventManager.EventParameter
+            {
+                DataType = "int",
+                Field = "maxHelicopters",
+                Input = EventManager.EventParameter.InputType.InputField,
+                IsRequired = true,
+                DefaultValue = 3,
+                Name = "Maximum Helicopters"
+            },
+            new EventManager.EventParameter
+            {
+                DataType = "float",
+                Field = "damageScaler",
+                Input = EventManager.EventParameter.InputType.InputField,
+                IsRequired = true,
+                DefaultValue = 1.0f,
+                Name = "Damage Scale"
+            },
+            new EventManager.EventParameter
+            {
+                DataType = "int",
+                Field = "heliHealth",
+                Input = EventManager.EventParameter.InputType.InputField,
+                IsRequired = true,
+                DefaultValue = 5000,
+                Name = "Heli Health"
             }
-        }
-        object CanBeTargeted(BaseCombatEntity target, MonoBehaviour turret)
-        {
-            if (usingCS && hasStarted)
-            {
-                if (target == null || turret == null) return null;
-                if (target is BasePlayer && turret is HelicopterTurret)
-                {
-                    if ((turret as HelicopterTurret)._heliAI && (turret as HelicopterTurret)._heliAI.GetComponent<CSHelicopter>())
-                    {
-                        if ((target as BasePlayer).GetComponent<CSPlayer>())
-                            return null;
-                        else
-                            return false;
-                    }
-                    else
-                    {
-                        return null;
-                    }
-                }
-            }
-            return null;
-        }
-        void OnChopperDeath(CSHelicopter helicopter)
-        {
-            CSHelicopters.Remove(helicopter);
-            ExtinguishFires(helicopter.helicopter.transform.position);
-            UnityEngine.Object.Destroy(helicopter);
-            if (CSHelicopters.Count <= 0)
-                NextRound();
-        }
+        };
+
+        public string ParameterIsValid(string fieldName, object value) => null;
         #endregion
 
-        #region Round Management
-        private void StartRounds()
-        {
-            currentWave = 1;
-            SendMessage(string.Format(MSG("firstWave"), configData.HelicopterSettings.SpawnBeginTimer));
-            SetPlayers();
-            GameTimers.Add(timer.Once(configData.HelicopterSettings.SpawnBeginTimer, () => SpawnWave()));
-            GameTimers.Add(timer.Repeat(5, 0, () => UpdateScores()));
-        }
-        private void NextRound()
-        {
-            DestroyTimers();
-            GameTimers.Add(timer.Repeat(5, 0, () => UpdateScores()));
-            currentWave++;
-            AddPoints();
-            if (EventManager.EventMode == EventManager.GameMode.Normal)
-            {
-                if (currentWave > gameRounds)
-                {
-                    FindWinner();
-                    return;
-                }
-            }
-            SetPlayers();
-            SendMessage(string.Format(MSG("nextWave"), configData.HelicopterSettings.SpawnWaveTimer));
-            GameTimers.Add(timer.Once(configData.HelicopterSettings.SpawnWaveTimer, () => SpawnWave()));
-        }
-        private void SetPlayers()
-        {
-            foreach (CSPlayer hs in CSPlayers)
-            {
-                EventManager.GivePlayerKit(hs.player, kit);
-                hs.player.health = configData.PlayerSettings.StartHealth;
-            }
-        }
+        #region Functions
+        private static string ToOrdinal(int i) => (i + "th").Replace("1th", "1st").Replace("2th", "2nd").Replace("3th", "3rd");
         #endregion
 
-        #region Helicopter Spawning
-        private void SpawnWave()
+        #region Event Classes
+        public class ChopperSurvivalEvent : EventManager.BaseEventGame
         {
-            if (usingCS && hasStarted)
+            public List<EventManager.BaseEventPlayer> winners;
+
+            private int playerLives;
+
+            private int rounds;
+
+            private int maxHelicopters;
+
+            private int heliHealth;
+
+            private float damageScaler;
+
+            private int currentRound = 0;
+
+            private List<EventHelicopter> eventHelicopters;
+
+            private Color COLOR_GREEN = new Color(0.0745098039215f, 0.79215686274509f, 0.329411764705882f);
+            private Color COLOR_RED = new Color(0.79215686274509f, 0.2588235294117647f, 0.074509803921568f);
+
+            internal override void InitializeEvent(IEventPlugin plugin, EventManager.EventConfig config)
             {
-                var num = System.Math.Ceiling(((float)currentWave / (float)gameRounds) * (float)enemyCount);
-                if (num < 1) num = 1;
-                if (currentWave == 1) InitStatModifiers();
-                else SetStatModifiers();
-                SpawnHelicopter((int)num);
-                if (configData.EventSettings.ShowHeliHealthUI)
-                {
-                    foreach(var heli in CSHelicopters)
-                    {
-                        RefreshHealthUI(heli);
-                    }
-                }
-                MessageAllPlayers("", string.Format(MSG("waveInbound"), currentWave));
+                playerLives = config.GetParameter<int>("playerLives");
+                rounds = config.GetParameter<int>("rounds");
+                maxHelicopters = config.GetParameter<int>("maxHelicopters");
+                heliHealth = config.GetParameter<int>("heliHealth");
+                damageScaler = config.GetParameter<float>("damageScaler");
+
+                eventHelicopters = Facepunch.Pool.GetList<EventHelicopter>();
+                winners = Facepunch.Pool.GetList<EventManager.BaseEventPlayer>();
+
+                base.InitializeEvent(plugin, config);
             }
-        }
-		private void SpawnHelicopter(int num)
-        {
-            bool lifetime = false;
-			if (ConVar.PatrolHelicopter.lifetimeMinutes == 0)
-			{
-				ConVar.PatrolHelicopter.lifetimeMinutes = 1;
-				lifetime = true;
-			}
 
-            for (int i = 0; i < num; i++)
+            protected override void OnDestroy()
             {
-                BaseHelicopter entity = (BaseHelicopter)GameManager.server.CreateEntity("assets/prefabs/npc/patrol helicopter/patrolhelicopter.prefab", new Vector3(), new Quaternion(), true);
-                entity.enableSaving = false;
-                entity.Spawn();
-                var component = entity.gameObject.AddComponent<CSHelicopter>();
-                component.SpawnHelicopter(GetDestination(), adjMainRotorHealth, adjTailRotorHealth, adjEngineHealth, adjHeliHealth, adjHeliBulletDamage);
-                CSHelicopters.Add(component);
-                if (entity == null) Puts("null heli");
-            }	
-			if(lifetime)
-				timer.Once(5f, () => ConVar.PatrolHelicopter.lifetimeMinutes = 0);
-            ConVar.PatrolHelicopter.bulletAccuracy = adjHeliAccuracy;
-        }
-        private Vector3 GetDestination() => (Vector3)Spawns.Call("GetRandomSpawn", spawnFile);
-        #endregion
+                for (int i = eventHelicopters.Count - 1; i >= 0; i--)
+                    Destroy(eventHelicopters[i]);
 
-        #region Stats
-        private void InitStatModifiers()
-        {
-            adjHeliBulletDamage = configData.HelicopterSettings.HeliBulletDamage;
-            adjHeliHealth = configData.HelicopterSettings.HeliHealth;
-            adjMainRotorHealth = configData.HelicopterSettings.MainRotorHealth;
-            adjEngineHealth = configData.HelicopterSettings.EngineHealth;
-            adjTailRotorHealth = configData.HelicopterSettings.TailRotorHealth;
-            adjHeliAccuracy = configData.HelicopterSettings.HeliAccuracy;
-            if (configData.EventSettings.ShowStatsInConsole) ShowHeliStats();
-        }
-        private void SetStatModifiers()
-        {
-            if (usingCS)
-            {
-                var HeliModifier = configData.HelicopterSettings.HeliModifier;
-                adjHeliBulletDamage *= HeliModifier;
-                adjHeliHealth *= HeliModifier;
-                adjMainRotorHealth *= HeliModifier;
-                adjEngineHealth *= HeliModifier;
-                adjTailRotorHealth = adjTailRotorHealth * HeliModifier;
-                adjHeliAccuracy = adjHeliAccuracy - (HeliModifier / 1.5f);
-                if (configData.EventSettings.ShowStatsInConsole) ShowHeliStats();
+                Facepunch.Pool.FreeList(ref eventHelicopters);
+                Facepunch.Pool.FreeList(ref winners);
+
+                base.OnDestroy();
             }
-        }
-        private void ShowHeliStats()
-        {
-            Puts("---- CS Heli Stats ----");
-            Puts("Modifier: " + configData.HelicopterSettings.HeliModifier);
-            Puts("Damage: " + adjHeliBulletDamage);
-            Puts("Health: " + adjHeliHealth);
-            Puts("Main rotor: " + adjMainRotorHealth);
-            Puts("Engine: " + adjEngineHealth);
-            Puts("Tail rotor: " + adjTailRotorHealth);
-            Puts("Accuracy: " + adjHeliAccuracy);
-        }
 
-        #endregion
-
-        #region Event Destruction
-        private void DieInstantly(BaseCombatEntity entity)
-        {
-            if (!entity.IsDestroyed)
+            internal override void PrestartEvent()
             {
-                Effect.server.Run(heliExplosion, entity.transform.position, Vector3.up, null, true);
-                OnChopperDeath(entity.GetComponent<CSHelicopter>());
-                entity.health = 0f;
-                entity.lifestate = BaseCombatEntity.LifeState.Dead;
-                entity.Kill(BaseNetworkable.DestroyMode.None);
+                CloseEvent();
+                base.PrestartEvent();
             }
-        }
-        private void ExtinguishFires(Vector3 position)
-        {
-            timer.In(3, () =>
+
+            protected override void StartEvent()
             {
-                var allobjects = Physics.OverlapSphere(position, 150);
-                foreach (var gobject in allobjects)
-                {
-                    if (gobject.name.ToLower().Contains("oilfireballsmall") || gobject.name.ToLower().Contains("napalm"))
-                    {
-                        var fire = gobject.GetComponent<BaseEntity>();
-                        if (fire == null) continue;
-                        if (BaseEntity.saveList.Contains(fire))
-                            BaseEntity.saveList.Remove(fire);
-                        fire.Kill();
-                    }
-                }
-            });
-        }
-        private void DestroyEvent()
-        {
-            hasStarted = false;
-            DestroyTimers();
-            DestroyHelicopters();
-        }	
-        private void DestroyHelicopters()
-        {
-            var helis = UnityEngine.Object.FindObjectsOfType<CSHelicopter>();
-            if (helis != null)
-                foreach (var heli in helis)                
-                    DieInstantly(heli.helicopter);                   
+                base.StartEvent();
+
+                GodmodeEnabled = true;
+
+                InvokeHandler.Invoke(this, StartRound, Configuration.TimeBetweenRounds);
+
+                BroadcastToPlayers(GetMessage, "Notification.RoundStartsIn", Configuration.TimeBetweenRounds);
+
+                InvokeHandler.InvokeRepeating(this, UpdateScoreboard, 1f, 1f);
+            }
+
+            internal override void EndEvent()
+            {
+                InvokeHandler.CancelInvoke(this, UpdateScoreboard);
                 
-            CSHelicopters.Clear();        
-        }       
-        private void DestroyTimers()
-        {
-            if (GameTimers != null)
-            {
-                foreach (var time in GameTimers)
-                    time.Destroy();
-                GameTimers.Clear();
+                base.EndEvent();
             }
-        }        
-        #endregion
 
-        private Vector3 FindGround(Vector3 sourcePos)
-        {
-            RaycastHit hitInfo;
-            if (Physics.Raycast(sourcePos, Vector3.down, out hitInfo, LayerMask.GetMask("Terrain", "World", "Construction")))            
-                sourcePos.y = hitInfo.point.y;            
-            sourcePos.y = Mathf.Max(sourcePos.y, TerrainMeta.HeightMap.GetHeight(sourcePos));
-            return sourcePos;
-        }   
+            protected override EventManager.BaseEventPlayer AddPlayerComponent(BasePlayer player)
+            {
+                ChopperSurvivalPlayer eventPlayer = player.gameObject.AddComponent<ChopperSurvivalPlayer>();
+                eventPlayer.LivesRemaining = playerLives;
+                return eventPlayer;
+            }
 
-        #region EventManager hooks
-        void RegisterGame()
-        {
-            EventManager.Events eventData = new EventManager.Events
+            protected override void OnPlayerSpawned(EventManager.BaseEventPlayer eventPlayer)
             {
-                CloseOnStart = true,
-                DisableItemPickup = false,
-                EnemiesToSpawn = configData.EventSettings.MaximumHelicopters,
-                EventType = Title,
-                GameMode = EventManager.GameMode.Normal,
-                GameRounds = configData.EventSettings.MaximumWaves,
-                Kit = configData.EventSettings.DefaultKit,
-                MaximumPlayers = 0,
-                MinimumPlayers = 2,
-                ScoreLimit = 0,
-                Spawnfile = configData.EventSettings.DefaultSpawnfile,
-                Spawnfile2 = null,
-                SpawnType = EventManager.SpawnType.Consecutive,
-                RespawnType = EventManager.RespawnType.Timer,
-                RespawnTimer = 5,
-                UseClassSelector = false,
-                WeaponSet = null,
-                ZoneID = configData.EventSettings.DefaultZoneID
-                
-            };
-            EventManager.EventSetting eventSettings = new EventManager.EventSetting
-            {
-                CanChooseRespawn = true,
-                CanUseClassSelector = true,
-                CanPlayBattlefield = true,
-                ForceCloseOnStart = true,
-                IsRoundBased = true,
-                LockClothing = false,
-                RequiresKit = true,
-                RequiresMultipleSpawns = false,
-                RequiresSpawns = true,
-                ScoreType = null,
-                SpawnsEnemies = true
-            };
-            var success = EventManager.RegisterEventGame(Title, eventSettings, eventData);
-            if (success == null)
-                Puts(MSG("noEvent"));
-        }
-        void OnSelectEventGamePost(string name)
-        {
-            if (Title == name)
-                usingCS = true;
-            else usingCS = false;
-            enemyCount = configData.EventSettings.MaximumHelicopters;
-            gameRounds = configData.EventSettings.MaximumWaves;
-        }
-        void OnEventPlayerSpawn(BasePlayer player)
-        {
-            if (usingCS && hasStarted && !isEnding)
-            {
-                if (!player.GetComponent<CSPlayer>())
-                    CSPlayers.Add(player.gameObject.AddComponent<CSPlayer>());
-                if (player.IsSleeping())
-                {
-                    player.EndSleeping();
-                    timer.In(1, () => OnEventPlayerSpawn(player));
-                    return;
-                }                
-                EventManager.GivePlayerKit(player, kit);
-				player.metabolism.hydration.value = configData.PlayerSettings.StartHydration;
-				player.metabolism.calories.value = configData.PlayerSettings.StartCalories;
-				player.health = configData.PlayerSettings.StartHealth;
-				timer.Once(3, ()=> { RefreshPlayerHealthUI(player.GetComponent<CSPlayer>()); });
+                if (Status == EventManager.EventStatus.Started)
+                    BroadcastToPlayer(eventPlayer, string.Format(GetMessage("Notification.LivesRemaining", eventPlayer.Player.userID), (eventPlayer as ChopperSurvivalPlayer).LivesRemaining));
             }
-        }       
-        object OnEventOpenPost()
-        {
-            if (usingCS)
-            {
-                CSPlayers = new List<CSPlayer>();
-                EventManager.BroadcastToChat(MSG("openBroad"));
-            }
-            return null;
-        }
 
-        object OnEventCancel()
-        {
-            if (usingCS && hasStarted)            
-                FindWinner();
-            return null;
-        }
-        object OnEventEndPre()
-        {
-            if (usingCS)
-            {     
-                DestroyTimers();
-                DestroyHelicopters();
-                foreach (var eventPlayer in CSPlayers)
-                    eventPlayer.DestroyAllUI();
-                FindWinner();                
-            }           
-            return null;
-        }    
-        object OnEventEndPost()
-        {
-            if (usingCS)
+            internal override bool CanDealEntityDamage(EventManager.BaseEventPlayer attacker, BaseEntity entity, HitInfo hitInfo)
             {
-                hasStarted = false;
-                var players = UnityEngine.Object.FindObjectsOfType<CSPlayer>();
-                if (players != null)
-                    foreach (var player in players)
-                        UnityEngine.Object.Destroy(player);
-                CSPlayers.Clear();                
-            }
-            return null;
-        }       
-        object OnEventStartPre()
-        {
-            if (usingCS)
-            {
-                hasStarted = true;
-                isEnding = false;
-            }          
-            return null;
-        }        
-        object OnSelectKit(string kitname)
-        {
-            if (usingCS)
-            {
-                kit = kitname;
+                EventHelicopter eventHelicopter = entity.GetComponent<EventHelicopter>();
+                if (eventHelicopter == null)
+                    return false;
+
+                if (damageScaler != 1f)
+                    hitInfo.damageTypes.ScaleAll(damageScaler);
+
+                int hitPoints;
+                if (!eventHelicopter.DealDamage(hitInfo, out hitPoints))
+                    EventManager.ClearDamage(hitInfo);
+
+                (attacker as ChopperSurvivalPlayer).HitPoints += hitPoints;
+
                 return true;
             }
-            return null;
-        }
-        
-        object OnEventJoinPost(BasePlayer player)
-        {
-            if (usingCS)
+
+            internal void OnHelicopterKilled(EventHelicopter eventHelicopter)
             {
-                if (player.GetComponent<CSPlayer>())
-                    UnityEngine.Object.DestroyImmediate(player.GetComponent<CSPlayer>());
-                CSPlayers.Add(player.gameObject.AddComponent<CSPlayer>());
-                EventManager.CreateScoreboard(player);
-                if (hasStarted)
-                    OnEventPlayerSpawn(player);                              
+                eventHelicopters.Remove(eventHelicopter);
+
+                if (eventHelicopters.Count == 0)
+                    EndRound();
             }
-            return null;
-        }       
-        object OnEventLeavePost(BasePlayer player)
-        {
-            if (usingCS)
+
+            internal override void OnPlayerTakeDamage(EventManager.BaseEventPlayer eventPlayer, HitInfo hitInfo)
             {
-                var csPlayer = player.GetComponent<CSPlayer>();
-                if (csPlayer != null)
+                EventManager.BaseEventPlayer attacker = EventManager.GetUser(hitInfo.InitiatorPlayer);
+                if (attacker != null)
                 {
-                    csPlayer.DestroyAllUI();
-                    CSPlayers.Remove(csPlayer);
-                    UnityEngine.Object.Destroy(csPlayer);
+                    EventManager.ClearDamage(hitInfo);
+                    return;
+                }
+
+                base.OnPlayerTakeDamage(eventPlayer, hitInfo);
+            }
+
+            internal override void OnEventPlayerDeath(EventManager.BaseEventPlayer victim, EventManager.BaseEventPlayer attacker = null, HitInfo info = null)
+            {
+                if (victim == null)
+                    return;
+
+                (victim as ChopperSurvivalPlayer).LivesRemaining -= 1;
+
+                if (GetPlayersRemainingCount() == 0)
+                {
+                    victim.AddPlayerDeath(null);
+
+                    InvokeHandler.Invoke(this, EndEvent, 0.1f);
+                    return;
+                }
+
+                victim.OnPlayerDeath(attacker, Configuration.RespawnTime);
+
+                base.OnEventPlayerDeath(victim, attacker);
+            }
+            
+            protected override void DisplayKillToChat(EventManager.BaseEventPlayer victim, string attackerName)
+            {
+                if (victim.IsOutOfBounds)
+                    BroadcastToPlayers(GetMessage, "Notification.Death.OOB", victim.Player.displayName);
+                else BroadcastToPlayers(GetMessage, "Notification.Death.Killed", victim.Player.displayName);
+            }
+
+            private int GetPlayersRemainingCount()
+            {
+                int count = 0;
+
+                for (int i = 0; i < eventPlayers.Count; i++)
+                {
+                    if ((eventPlayers[i] as ChopperSurvivalPlayer).LivesRemaining > 0)
+                        count++;
+                }
+
+                return count;
+            }
+
+            protected override void GetWinningPlayers(ref List<EventManager.BaseEventPlayer> winners)
+            {
+                winners.AddRange(this.winners);
+            }
+
+            #region Round Management
+            private void StartRound()
+            {
+                GodmodeEnabled = false;
+
+                currentRound += 1;
+
+                StartCoroutine(SpawnRoundHelicopters());
+            }
+
+            private void EndRound()
+            {
+                GodmodeEnabled = true;
+
+                if (currentRound >= rounds)
+                {
+                    winners.AddRange(eventPlayers);
+                    InvokeHandler.Invoke(this, EndEvent, 0.1f);
+                }
+                else
+                {
+                    InvokeHandler.Invoke(this, StartRound, Configuration.TimeBetweenRounds);
+                    BroadcastToPlayers(GetMessage, "Notification.RoundStartsIn", Configuration.TimeBetweenRounds);
+
+                    StartCoroutine(ResetPlayers());
                 }
             }
-            if (hasStarted && CSPlayers.Count == 0)
-            {
-                isEnding = true;
-                EventManager.EndEvent();
-            }                                 
-            return null;
-        }        
-        void OnEventPlayerDeath(BasePlayer victim, HitInfo hitinfo)
-        {
-            if (usingCS && hasStarted)
-            {
-                DestroyAllHealthUI(victim);
-                victim.GetComponent<CSPlayer>().deaths++;
-                int LivesLeft = (configData.PlayerSettings.DeathLimit - victim.GetComponent<CSPlayer>().deaths);
 
-                SendMessage(string.Format(MSG("eventDeath"), victim.displayName, victim.GetComponent<CSPlayer>().deaths, configData.PlayerSettings.DeathLimit));               
-                SendReply(victim, string.Format(MSG("livesLeft"), LivesLeft));
+            private IEnumerator ResetPlayers()
+            {
+                List<EventManager.BaseEventPlayer> currentPlayers = Facepunch.Pool.GetList<EventManager.BaseEventPlayer>();
+                currentPlayers.AddRange(eventPlayers);
 
-                if (victim.GetComponent<CSPlayer>().deaths >= configData.PlayerSettings.DeathLimit)
+                for (int i = 0; i < currentPlayers.Count; i++)
                 {
-                    if (CSPlayers.Count == 1)
+                    EventManager.BaseEventPlayer eventPlayer = currentPlayers[i];
+                    if (eventPlayer != null)
                     {
-                        Winner(new List<BasePlayer> { victim });
-                        return;
+                        if (eventPlayer.IsDead)
+                            EventManager.ResetPlayer(eventPlayer.Player);
+                        else
+                        {
+                            EventManager.StripInventory(eventPlayer.Player);
+                            EventManager.ResetMetabolism(eventPlayer.Player);
+                            EventManager.GiveKit(eventPlayer.Player, eventPlayer.Kit);
+                        }
                     }
-                    EventManager.LeaveEvent(victim);                    
+
+                    yield return CoroutineEx.waitForEndOfFrame;
+                    yield return CoroutineEx.waitForEndOfFrame;
+                }
+
+                Facepunch.Pool.FreeList(ref currentPlayers);
+            }
+            #endregion
+
+            #region Spawn Helicopters
+            private IEnumerator SpawnRoundHelicopters()
+            {
+                int helicoptersToSpawn = Mathf.Max(1, Mathf.RoundToInt((float)maxHelicopters * ((float)currentRound / (float)rounds)));
+
+                for (int i = 0; i < helicoptersToSpawn; i++)
+                {
+                    Vector3 destination = _spawnSelectorA.GetSpawnPoint();
+                    Vector2 random = (UnityEngine.Random.insideUnitCircle.normalized * Configuration.MaxTravelDistance);
+
+                    Vector3 position = destination + new Vector3(random.x, 50f, random.y);
+
+                    BaseHelicopter baseHelicopter = GameManager.server.CreateEntity(HELICOPTER_PREFAB, position) as BaseHelicopter;
+                    baseHelicopter.enableSaving = false;
+                    baseHelicopter.Spawn();
+
+                    EventHelicopter eventHelicopter = baseHelicopter.gameObject.AddComponent<EventHelicopter>();
+                    eventHelicopter.OnHelicopterSpawned(this, i + 1);
+
+                    eventHelicopter.Entity.health = heliHealth;
+                    eventHelicopter.Entity.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
+
+                    eventHelicopters.Add(eventHelicopter);
+
+                    yield return CoroutineEx.waitForSeconds(1f);
+
+                    eventHelicopter.SetPositionDestination(position, destination);
                 }
             }
-            return;
-        }   
-        
-        object OnEventStartPost()
-        {
-            if (usingCS)
-            {
-                EventManager.CloseEvent();
-                StartRounds();
-                UpdateScores();
-            }         
-            return null;
-        }
-        void SetEnemyCount(int number) => enemyCount = number;
-        void SetGameRounds(int number) => gameRounds = number;
-        void SetSpawnfile(bool isTeamA, string spawnfile) => spawnFile = spawnfile;
-        #endregion
+            #endregion
 
-        #region Messaging
-        void SendMessage(string message)
-        {
-            if (configData.EventSettings.UseUINotifications)
-                EventManager.PopupMessage(message);
-            else PrintToChat(message);
+            #region Scoreboards
+            protected override void BuildScoreboard()
+            {
+                scoreContainer = EMInterface.CreateScoreboardBase(this);
+
+                int index = -1;
+
+                EMInterface.CreatePanelEntry(scoreContainer, string.Format(GetMessage("Score.RoundNumber", 0UL), currentRound, rounds), index += 1);
+
+                for (int i = 0; i < eventHelicopters.Count; i++)
+                {
+                    EventHelicopter eventHelicopter = eventHelicopters[i];
+
+                    CreateHealthBar(scoreContainer, string.Format(GetMessage("Score.Heli", 0UL), eventHelicopter.ID), eventHelicopter.Entity.health / heliHealth, index += 1);
+                }
+
+                EMInterface.CreatePanelEntry(scoreContainer, string.Format(GetMessage("Score.Remaining", 0UL), eventPlayers.Count), index += 1);
+                
+                for (int i = 0; i < Mathf.Min(scoreData.Count, 15); i++)
+                {
+                    EventManager.ScoreEntry score = scoreData[i];
+                    EMInterface.CreateScoreEntry(scoreContainer, $"{score.displayName} | ({score.value1} pts)", string.Empty, string.Empty, i + index + 1);
+                }
+            }
+
+            private void CreateHealthBar(CuiElementContainer container, string text, float health, int index)
+            {
+                float yMax = -(1f * index);
+                float yMin = -(1f * (index + 1));
+
+                UI.Panel(container, EMInterface.UI_SCORES, EMInterface.Configuration.Scoreboard.Foreground.Get, new UI4(0f, yMin + 0.02f, 1f, yMax - 0.02f));
+
+                UI.Label(container, EMInterface.UI_SCORES, text, 11, new UI4(0.05f, yMin, 1f, yMax), TextAnchor.MiddleLeft);
+
+                UI.Panel(container, EMInterface.UI_SCORES, GetInterpolatedColor(health, 0.75f), new UI4(0.25f, yMin + 0.05f, 0.25f + (0.74f * health), yMax - 0.05f));
+            }
+
+            private string GetInterpolatedColor(float delta, float alpha)
+            {
+                Color col = Color.Lerp(COLOR_RED, COLOR_GREEN, delta);
+                return $"{col.r} {col.g} {col.b} {alpha}";
+            }
+
+            protected override float GetFirstScoreValue(EventManager.BaseEventPlayer eventPlayer) => (eventPlayer as ChopperSurvivalPlayer).HitPoints;
+
+            protected override float GetSecondScoreValue(EventManager.BaseEventPlayer eventPlayer) => (eventPlayer as ChopperSurvivalPlayer).LivesRemaining;
+
+            protected override void SortScores(ref List<EventManager.ScoreEntry> list)
+            {
+                list.Sort(delegate (EventManager.ScoreEntry a, EventManager.ScoreEntry b)
+                {
+                    int primaryScore = a.value1.CompareTo(b.value1);
+
+                    if (primaryScore == 0)
+                        return a.value2.CompareTo(b.value2);
+
+                    return primaryScore;
+                });
+            }
+            #endregion
+
+            internal override void GetAdditionalEventDetails(ref List<KeyValuePair<string, object>> list, ulong playerId)
+            {
+                list.Add(new KeyValuePair<string, object>(GetMessage("UI.Rounds", playerId), rounds));
+                list.Add(new KeyValuePair<string, object>(GetMessage("UI.PlayerLives", playerId), playerLives));
+                list.Add(new KeyValuePair<string, object>(GetMessage("UI.MaxHelicopters", playerId), maxHelicopters));
+                list.Add(new KeyValuePair<string, object>(GetMessage("UI.DamageScaler", playerId), damageScaler));
+            }
         }
-        private string MSG(string msg) => lang.GetMessage(msg, this);
-        
-        private void MessageAllPlayers(string msg, string keyword = "", bool title = false)
+
+        private class ChopperSurvivalPlayer : EventManager.BaseEventPlayer
         {
-            string titlestring = "";
-            if (title) titlestring = lang.GetMessage("title", this);
-            EventManager.BroadcastEvent($"{configData.Messaging.MainColor} {titlestring} {keyword}</color> {configData.Messaging.MSGColor} {msg}</color>");
-        }        
-        private void RegisterMessages() => lang.RegisterMessages(new Dictionary<string, string>()
+            internal int LivesRemaining { get; set; }
+
+            internal int HitPoints { get; set; }
+
+            internal override void OnPlayerDeath(EventManager.BaseEventPlayer attacker = null, float respawnTime = 5)
+            {
+                AddPlayerDeath();
+
+                DestroyUI();
+
+                string message = string.Empty;
+
+                if (LivesRemaining <= 0)
+                {
+                    int position = Event.GetAlivePlayerCount();
+
+                    message = IsOutOfBounds ? string.Format(GetMessage("UI.Death.OOB.Kicked", Player.userID), ToOrdinal(position + 1), position) :
+                              string.Format(GetMessage("UI.Death.Killed.Kicked", Player.userID), ToOrdinal(position + 1), position);
+                }
+                else
+                {
+                    _respawnDurationRemaining = respawnTime;
+
+                    InvokeHandler.InvokeRepeating(this, RespawnTick, 1f, 1f);
+
+                    message = IsOutOfBounds ? GetMessage("UI.Death.OOB", Player.userID) :
+                              GetMessage("UI.Death.Killed", Player.userID);
+                }
+
+                EMInterface.DisplayDeathScreen(this, message, LivesRemaining > 0);
+            }
+        }
+
+        internal class EventHelicopter : MonoBehaviour
         {
-            {"noEvent", "Event plugin doesn't exist" },
-            {"noConfig", "Creating a new config file" },
-            {"title", "ChopperSurvival : "},
-            {"fFire", "Friendly Fire!"},
-            {"nextWave", "Next wave in {0} seconds!"},
-            {"noPlayers", "The event has no more players, auto-closing."},
-            {"openBroad", "Fend off waves of attacking helicopters! Each hit gives you a point, Rotor hits are worth more. The last player standing, or the player with the most points wins!"},
-            {"eventWin", "{0} has won the event!"},
-            {"eventDeath", "{0} has died {1}/{2} times!"},
-            {"waveInbound", "Wave {0} inbound!"},
-            {"firstWave", "You have {0} seconds to prepare for the first wave!"},
-            {"heliDest", "Helicopter Destroyed!"},
-            {"livesLeft", "You have {0} lives remaining!"},
-            {"notEnough", "Not enough players to start the event"}
-        },this);
+            internal BaseHelicopter Entity { get; private set; }
+
+            internal PatrolHelicopterAI AI { get; private set; }
+
+            internal ChopperSurvivalEvent Event { get; private set; }
+
+            internal int ID { get; private set; }
+
+            private Transform tr;
+
+            private Vector3 centerDestination;
+
+            private RaycastHit raycastHit;
+
+            private uint tailRotorBone;
+            private uint mainRotorBone;
+
+            private List<PatrolHelicopterAI.targetinfo> _targets;
+
+            private const string HELIEXPLOSION_EFFECT = "assets/prefabs/npc/patrol helicopter/effects/heli_explosion.prefab";
+
+            private void Awake()
+            {
+                Entity = GetComponent<BaseHelicopter>();
+                AI = Entity.myAI;
+
+                tr = Entity.transform;
+                AI.enabled = false;
+
+                _targets = Facepunch.Pool.GetList<PatrolHelicopterAI.targetinfo>();
+
+                tailRotorBone = StringPool.Get("tail_rotor_col");
+                mainRotorBone = StringPool.Get("main_rotor_col");
+            }
+
+            internal void OnHelicopterSpawned(ChopperSurvivalEvent chopperSurvivalEvent, int id)
+            {
+                this.Event = chopperSurvivalEvent;
+                this.ID = id;
+            }
+
+            private void Update()
+            {
+                if (AI.isDead)
+                {
+                    KillHelicopter();
+                    return;
+                }
+
+                if (Vector3Ex.Distance2D(tr.position, centerDestination) > Configuration.MaxTravelDistance)
+                    AI.SetTargetDestination(centerDestination);
+
+                UpdateTargetList();
+
+                AI.MoveToDestination();
+                AI.UpdateRotation();
+                AI.UpdateSpotlight();
+                AI.AIThink();
+                AI.DoMachineGuns();                
+            }
+
+            private void OnDestroy()
+            {
+                Facepunch.Pool.FreeList(ref _targets);
+
+                if (Entity != null && !Entity.IsDestroyed)
+                    Entity.Kill(BaseNetworkable.DestroyMode.None);
+            }
+
+            internal void SetPositionDestination(Vector3 position, Vector3 destination)
+            {
+                tr.position = position;
+                centerDestination = destination;
+
+                AI.SetTargetDestination(destination);
+            }
+
+            private void UpdateTargetList()
+            {
+                Vector3 strafePos = Vector3.zero;
+                bool isStrafing = false;
+                bool shouldUseNapalm = false;
+                for (int i = _targets.Count - 1; i >= 0; i--)
+                {
+                    PatrolHelicopterAI.targetinfo targetinfo = _targets[i];
+
+                    if (targetinfo == null || targetinfo.ent == null)
+                        _targets.Remove(targetinfo);                    
+                    else
+                    {
+                        if (Time.realtimeSinceStartup > targetinfo.nextLOSCheck)
+                        {
+                            targetinfo.nextLOSCheck = Time.realtimeSinceStartup + 1f;
+                            if (PlayerVisible(targetinfo.ply))
+                            {
+                                targetinfo.lastSeenTime = Time.realtimeSinceStartup;
+                                targetinfo.visibleFor += 1f;
+                            }
+                            else targetinfo.visibleFor = 0f;                            
+                        }
+
+                        bool isDead = targetinfo.ply ? targetinfo.ply.IsDead() : (targetinfo.ent.Health() <= 0f);
+
+                        if (targetinfo.TimeSinceSeen() >= 6f || isDead)
+                        {
+                            if ((CanStrafe() || CanUseNapalm()) && AI.IsAlive() && !isStrafing && !isDead && (targetinfo.ply == AI.leftGun._target || targetinfo.ply == AI.rightGun._target))
+                            {
+                                shouldUseNapalm = (!ValidStrafeTarget(targetinfo.ply) || UnityEngine.Random.Range(0f, 1f) > 0.75f);                                
+                                strafePos = targetinfo.ply.transform.position;
+                                isStrafing = true;
+                            }
+
+                            _targets.Remove(targetinfo);
+                        }
+                    }
+                }
+
+                foreach (EventManager.BaseEventPlayer eventPlayer in Event.eventPlayers)
+                {
+                    BasePlayer player = eventPlayer.Player;
+
+                    if (Vector3Ex.Distance2D(tr.position, player.transform.position) <= 150f)
+                    {
+                        bool isCurrentTarget = false;
+                        for (int i = 0; i < _targets.Count; i++)
+                        {
+                            PatrolHelicopterAI.targetinfo targetInfo = _targets[i];
+
+                            if (targetInfo.ply == player)
+                            {
+                                isCurrentTarget = true;
+                                break;
+                            }
+                        }
+                       
+                        if (!isCurrentTarget && PlayerVisible(player))
+                        {
+                            _targets.Add(new PatrolHelicopterAI.targetinfo(player, player));
+                        }
+                    }
+                }
+
+                if (isStrafing)
+                {
+                    AI.ExitCurrentState();
+                    AI.State_Strafe_Enter(strafePos, shouldUseNapalm);
+                }
+
+                AI._targetList.Clear();
+                AI._targetList.AddRange(_targets);
+            }
+
+            private bool PlayerVisible(BasePlayer player)
+            {                             
+                Vector3 targetPosition = player.eyes.position;
+                
+                Vector3 position = AI.transform.position - (Vector3.up * 6f);                
+                Vector3 direction = (targetPosition - position).normalized;
+                float maxDistance = Vector3.Distance(targetPosition, position);
+
+                if (GamePhysics.Trace(new Ray(position + (direction * 5f), direction), 0f, out raycastHit, maxDistance * 1.1f, 1218652417, QueryTriggerInteraction.UseGlobal) && raycastHit.collider.gameObject.ToBaseEntity() == player)                
+                    return true;                
+                return false;
+            }
+
+            private bool ValidStrafeTarget(BasePlayer player)
+            {                
+                return !player.IsNearEnemyBase();
+            }
+
+            private bool CanStrafe()
+            {                
+                if (Time.realtimeSinceStartup - AI.lastStrafeTime < 20f)
+                    return false;                
+                return AI.CanInterruptState();
+            }
+
+            private bool CanUseNapalm()
+            {                
+                return Time.realtimeSinceStartup - AI.lastNapalmTime >= 30f;
+            }
+
+            internal bool DealDamage(HitInfo hitInfo, out int hitPoints)
+            {
+                hitPoints = hitInfo.HitBone == mainRotorBone || hitInfo.HitBone == tailRotorBone ? Configuration.RotorHitPoints : Configuration.HeliHitPoints;
+
+                float totalDamage = hitInfo.damageTypes.Total();
+                if (totalDamage >= Entity.health)
+                {
+                    KillHelicopter();
+                    return false;
+                }
+
+                return true;
+            }
+
+            private void KillHelicopter()
+            {
+                Event.OnHelicopterKilled(this);
+                Effect.server.Run(HELIEXPLOSION_EFFECT, tr.position);
+                Destroy(this);
+            }
+        }
         #endregion
 
         #region Config        
-        private ConfigData configData;
-        class EventSettings
+        private static ConfigData Configuration;
+
+        private class ConfigData
         {
-            public string DefaultKit { get; set; }
-            public string DefaultSpawnfile { get; set; }
-            public string DefaultZoneID { get; set; }
-            public int MaximumWaves { get; set; }
-            public int MaximumHelicopters { get; set; }
-            public bool ShowStatsInConsole { get; set; }
-            public bool ShowHeliHealthUI { get; set; }
-            public bool ShowScoreboard { get; set; }
-            public bool UseUINotifications { get; set; }
-        }
-        class PlayerSettings
-        {
-            public float StartHealth { get; set; }
-            public float StartHydration { get; set; }
-            public float StartCalories { get; set; }  
-            public int DeathLimit { get; set; }  
-            public float FFDamageScale { get; set; }    
-        }
-        class HeliSettings
-        {
-            public float HeliBulletDamage { get; set; }
-            public float HeliHealth { get; set; }
-            public float MainRotorHealth { get; set; }
-            public float TailRotorHealth { get; set; }
-            public float EngineHealth { get; set; }
-            public float HeliSpeed { get; set; }
-            public float HeliAccuracy { get; set; }
-            public float HeliModifier { get; set; }
-            public float SpawnDistance { get; set; }
-            public float CheckDistanceTimer { get; set; }
-            public float DestinationHeightAdjust { get; set; }
-            public float SpawnWaveTimer { get; set; }
-            public float SpawnBeginTimer { get; set; }            
-            public bool UseRockets { get; set; }
-        }
-        class Messaging
-        {
-            public string MainColor { get; set; }
-            public string MSGColor { get; set; }
-        }
-        class ConfigData
-        {
-            public EventSettings EventSettings { get; set; }
-            public HeliSettings HelicopterSettings { get; set; }
-            public PlayerSettings PlayerSettings { get; set; }
-            public Messaging Messaging { get; set; }
-            public Scoring Scoring { get; set; }
-        }
-        class Scoring
-        {
+            [JsonProperty(PropertyName = "Respawn time (seconds)")]
+            public int RespawnTime { get; set; }
+
+            [JsonProperty(PropertyName = "Maximum distance helicopters can travel away from the arena")]
+            public float MaxTravelDistance { get; set; }
+
+            [JsonProperty(PropertyName = "Amount of points given to players when they shoot a rotor")]
             public int RotorHitPoints { get; set; }
+
+            [JsonProperty(PropertyName = "Amount of points given to players when they shoot the heli")]
             public int HeliHitPoints { get; set; }
-            public int SurvivalTokens { get; set; }
-            public int WinnerTokens { get; set; }
+
+            [JsonProperty(PropertyName = "Amount of time between rounds (seconds)")]
+            public int TimeBetweenRounds { get; set; }
+
+            public Oxide.Core.VersionNumber Version { get; set; }
         }
-        private void LoadVariables()
+
+        protected override void LoadConfig()
         {
-            LoadConfigVariables();
-            SaveConfig();
+            base.LoadConfig();
+            Configuration = Config.ReadObject<ConfigData>();
+
+            if (Configuration.Version < Version)
+                UpdateConfigValues();
+
+            Config.WriteObject(Configuration, true);
         }
-        protected override void LoadDefaultConfig()
+
+        protected override void LoadDefaultConfig() => Configuration = GetBaseConfig();
+
+        private ConfigData GetBaseConfig()
         {
-            var config = new ConfigData
+            return new ConfigData
             {
-                EventSettings = new EventSettings
-                {                    
-                    DefaultKit = "cskit",
-                    DefaultSpawnfile = "csspawns",
-                    DefaultZoneID = "cszone",
-                    MaximumHelicopters = 4,
-                    MaximumWaves = 10,
-                    ShowHeliHealthUI = true,
-                    ShowStatsInConsole = true,
-                    ShowScoreboard = true,
-                    UseUINotifications = true
-                },
-                HelicopterSettings = new HeliSettings
-                {
-                    CheckDistanceTimer = 10f,
-                    DestinationHeightAdjust = 10f,
-                    EngineHealth = 800f,
-                    HeliAccuracy = 8f,
-                    HeliBulletDamage = 4f,
-                    HeliHealth = 3800f,
-                    HeliModifier = 1.22f,
-                    HeliSpeed = 24f,
-                    MainRotorHealth = 420f,
-                    SpawnBeginTimer = 20f,
-                    SpawnDistance = 500f,
-                    SpawnWaveTimer = 10f,
-                    TailRotorHealth = 300f,
-                    UseRockets = true
-                },
-                Messaging = new Messaging
-                {                    
-                    MainColor = "<color=#FF8C00>",
-                    MSGColor = "<color=#939393>"
-                },
-                PlayerSettings = new PlayerSettings
-                {                    
-                    DeathLimit = 10,
-                    FFDamageScale = 0,
-                    StartCalories = 500f,
-                    StartHealth = 100f,
-                    StartHydration = 250f
-                },
-                Scoring = new Scoring
-                {
-                    HeliHitPoints = 1,
-                    RotorHitPoints = 3,
-                    SurvivalTokens = 1,
-                    WinnerTokens = 10
-                }
+                RespawnTime = 5,
+                MaxTravelDistance = 200f,
+                RotorHitPoints = 10,
+                HeliHitPoints = 1,
+                TimeBetweenRounds = 10,
+                Version = Version
             };
-            SaveConfig(config);
         }
-        private void LoadConfigVariables() => configData = Config.ReadObject<ConfigData>();
-        void SaveConfig(ConfigData config) => Config.WriteObject(config, true);
+
+        protected override void SaveConfig() => Config.WriteObject(Configuration, true);
+
+        private void UpdateConfigValues()
+        {
+            PrintWarning("Config update detected! Updating config values...");
+
+            Configuration.Version = Version;
+            PrintWarning("Config update completed!");
+        }
+
         #endregion
-       
-        #region Scoring
-        void AddPoints()
+
+        #region Localization
+        public string Message(string key, ulong playerId = 0U) => lang.GetMessage(key, this, playerId != 0U ? playerId.ToString() : null);
+
+        private static Func<string, ulong, string> GetMessage;
+
+        private readonly Dictionary<string, string> Messages = new Dictionary<string, string>
         {
-            foreach (CSPlayer helisurvivalplayer in CSPlayers)            
-                EventManager.AddTokens(helisurvivalplayer.player.userID, configData.Scoring.SurvivalTokens);
-        }
-        void FindWinner()
-        {
-            if (isEnding) return;    
-            List<BasePlayer> winners = new List<BasePlayer>();
-            int score = 0;
-            foreach (var csPlayer in CSPlayers)
-            {
-                if (csPlayer.points > score)
-                {
-                    winners.Clear();
-                    winners.Add(csPlayer.player);
-                    score = csPlayer.points;
-                }
-                else if (csPlayer.points == score)
-                    winners.Add(csPlayer.player);                
-            }
-            Winner(winners);
-        }        
-        void Winner(List<BasePlayer> winners)
-        {
-            isEnding = true;
-            string winnerNames = "";
-            for (int i = 0; i < winners.Count; i++)
-            {
-                EventManager.AddTokens(winners[i].userID, configData.Scoring.WinnerTokens, true);
-                winnerNames += winners[i].displayName;
-                if (winners.Count > i + 1)
-                    winnerNames += ", ";
-            }
-            EventManager.BroadcastToChat(string.Format(MSG("eventWin"), winnerNames));
-            EventManager.EndEvent();            
-        }
+            ["Score.HitPoints"] = "Hit Points: {0}",
+            ["Score.Name"] = "Hit Points",
+            ["Score.RoundNumber"] = "Round {0} / {1}",
+            ["Score.HelisRemaining"] = "Helicopters Remaining : {0}",
+            ["Score.Remaining"] = "Players Remaining : {0}",
+            ["Score.Heli"] = "Heli {0}",
+
+            ["Notification.LivesRemaining"] = "You have {0} lives remaining!",
+            ["Notification.Death.OOB"] = "<color=#007acc>{0}</color> tried to run away...",
+            ["Notification.Death.Killed"] = "<color=#007acc>{0}</color> has been killed",
+
+            ["UI.Death.Killed.Kicked"] = "You was killed...\nYou placed {0}\n{1} players remain",
+            ["UI.Death.OOB.Kicked"] = "You left the playable area\nYou placed {0}\n{1} players remain",
+
+            ["UI.Death.Killed"] = "You was killed...",
+            ["UI.Death.OOB"] = "You left the playable area",
+
+            ["UI.Rounds"] = "Rounds",
+            ["UI.PlayerLives"] = "Player Lives",
+            ["UI.MaxHelicopters"] = "Maximum Helicopters",
+            ["UI.DamageScaler"] = "Damage Scale",
+            ["UI.HelicoptersRemaining"] = "Helicopters Remaining : {0}",
+
+            ["Notification.RoundStartsIn"] = "Next round starts in <color=#007acc>{0}</color> seconds"
+        };
         #endregion
     }
 }
-

@@ -1,1032 +1,538 @@
 ﻿// Requires: EventManager
+using Newtonsoft.Json;
+using Oxide.Plugins.EventManagerEx;
+using System;
 using System.Collections.Generic;
-using UnityEngine;
-using Rust;
-using System.Linq;
-using System.IO;
-using Oxide.Core;
-using Oxide.Core.Plugins;
 using System.Globalization;
-using System.Collections;
+using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CaptureTheFlag", "k1lly0u", "0.1.62", ResourceId = 2259)]
-    class CaptureTheFlag : RustPlugin
+    [Info("CaptureTheFlag", "k1lly0u", "0.4.0"), Description("Capture the flag event mode for EventManager")]
+    class CaptureTheFlag : RustPlugin, IEventPlugin
     {
-        #region Fields
-        [PluginReference] EventManager EventManager;
-        [PluginReference] Plugin Spawns;
-
-        static GameObject webObject;
-        static UnityWeb uWeb;
-
-        private static readonly int playerLayer = LayerMask.GetMask("Player (Server)");
-
-        static CaptureTheFlag ctf;
-
-        private List<CTFPlayer> CTFPlayers;
-        private Dictionary<Team, uint> flagIDs;      
-
-        private bool usingCTF;
-        private bool hasStarted;
-        private bool gameEnding;
-
-        private int ACaps;
-        private int BCaps;
-        private int ScoreLimit;
-
-        private string TeamASpawns;
-        private string TeamBSpawns;
-
-        private string Kit;
-
-        private CTFFlag FlagA;
-        private CTFFlag FlagB;        
-        #endregion
-
-        #region Player Class
-        class CTFPlayer : MonoBehaviour
-        {
-            public BasePlayer player;
-            public Team team;
-            public int caps;
-            public bool hasFlag;
-
-            void Awake()
-            {
-                player = GetComponent<BasePlayer>();
-                enabled = false;
-                caps = 0;
-                hasFlag = false;
-            }
-            public void ClearInventory()
-            {         
-                for (int i = 0; i < player.inventory.containerBelt.itemList.Count; i++)
-                    player.inventory.containerBelt.itemList[i].Remove(0.01f);
-                for (int i = 0; i < player.inventory.containerMain.itemList.Count; i++)
-                    player.inventory.containerMain.itemList[i].Remove(0.01f);
-                player.SendNetworkUpdateImmediate();
-            }            
-        }      
-        
-        class CTFFlag : MonoBehaviour
-        {
-            private Vector3 homePos;
-            private BasePlayer carrier;
-            private Color color;
-
-            public BaseEntity flag;
-            public Team team;
-            public FlagState flagState;
-
-            void Awake()
-            {
-                gameObject.layer = (int)Layer.Reserved1;
-                enabled = false;
-            }
-            private void OnDestroy()
-            { 
-                CancelInvoke();
-
-                carrier = null;
-                flag.parentEntity.Set(null);
-                flag.transform.localPosition = Vector3.zero;
-                flag.transform.position = homePos;
-                flag.UpdateNetworkGroup();
-                flag.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
-                flagState = FlagState.Stationary;
-                                
-                (flag as BaseCombatEntity).DieInstantly();
-            }
-            public void InitializeFlag(Team team, Vector3 spawnPoint)
-            {
-                gameObject.name = $"CTFFlag_{team}";
-
-                this.team = team;
-                color = HexToColor(team == Team.A ? ctf.configData.TeamA.Color : ctf.configData.TeamB.Color);
-
-                transform.position = spawnPoint;
-                homePos = spawnPoint;
-
-                flag = GameManager.server.CreateEntity(ctf.configData.GameSettings.FlagType, spawnPoint, new Quaternion(), true);                
-                flag.enableSaving = false;
-                if (flag.GetComponent<Signage>())
-                {
-                    flag.GetComponent<Signage>().textureID = ctf.flagIDs[team];
-                    flag.SetFlag(BaseEntity.Flags.Locked, true, false);
-                    flag.SendNetworkUpdateImmediate();
-                    flag.OwnerID = 0U;
-                }
-                flag.Spawn();
-                
-                transform.SetParent(flag.transform);                
-
-                foreach (Collider c in flag.GetComponents<Collider>())
-                    c.enabled = false;
-
-                var innerRB = flag.gameObject.AddComponent<Rigidbody>();
-                innerRB.useGravity = false;
-                innerRB.isKinematic = true;
-
-                var collider = gameObject.AddComponent<SphereCollider>();
-                collider.transform.position = flag.transform.position + Vector3.up;
-                collider.isTrigger = true;
-                collider.radius = 1f;
-
-                gameObject.SetActive(true);
-                enabled = true;
-
-                InvokeRepeating("ShowLocation", 0f, ctf.configData.GameSettings.FlagMarkerRefreshRate);
-            }
-           
-            void OnTriggerEnter(Collider obj)
-            {
-                var player = obj?.GetComponentInParent<BasePlayer>();
-                if (player != null)
-                {
-                    if (ctf.gameEnding) return;
-                    if (flagState == FlagState.Stationary)
-                    {
-                        if (player.IsDead() || !player.IsAlive() || player.IsWounded()) return;
-                        if (player.GetComponent<EventManager.EventPlayer>()?.isDead ?? false) return;
-                        var ctfPlayer = player.GetComponent<CTFPlayer>();
-                        if (ctfPlayer != null)
-                        {
-                            if (ctfPlayer.team != team)
-                            {
-                                if (IsInvoking("AutoRestore"))
-                                    CancelInvoke("AutoRestore");
-                                carrier = player;
-                                ctfPlayer.hasFlag = true;
-                                ctfPlayer.ClearInventory();
-                                SetupFlag();
-                                ctf.SendMessage($"{ctf.configData.Messaging.MainColor}{player.displayName}</color>{ctf.configData.Messaging.MSGColor} {msg("has taken")} </color>{ctf.configData.Messaging.MainColor}{ctf.GetTeamName(team)}'s</color>{ctf.configData.Messaging.MSGColor} {msg("flag")}!</color>");
-                                return;
-                            }
-                            if (ctfPlayer.team == team && flag.transform.position != homePos)
-                            {
-                                if (IsInvoking("AutoRestore"))
-                                    CancelInvoke("AutoRestore");
-                                RestoreFlag(player.displayName);
-                                return;
-                            }
-                            if (ctfPlayer.team == team && flag.transform.position == homePos && ctfPlayer.hasFlag)
-                            {
-                                ctfPlayer.hasFlag = false;
-                                Team otherTeam = Team.NONE;
-                                switch (team)
-                                {
-                                    case Team.A:
-                                        ctf.FlagB.RestoreFlag();
-                                        otherTeam = Team.B;
-                                        break;
-                                    case Team.B:
-                                        ctf.FlagA.RestoreFlag();
-                                        otherTeam = Team.A;
-                                        break;
-                                    default:
-                                        break;
-                                }
-                                ctf.EventManager.GivePlayerKit(player, ctf.Kit);
-                                ctfPlayer.caps++;                                                               
-                                ctf.EventManager.AddStats(player, EventManager.StatType.Flags);
-                                ctf.AddCapturePoint(ctfPlayer.player, team);
-                                ctf.SendMessage($"{ctf.configData.Messaging.MainColor}{player.displayName}</color>{ctf.configData.Messaging.MSGColor} {msg("has captured")} </color>{ctf.configData.Messaging.MainColor}{ctf.GetTeamName(otherTeam)}'s</color>{ctf.configData.Messaging.MSGColor} {msg("flag")}!</color>");
-                                return;
-                            }
-                        }
-                    }
-                }
-            }          
-            private void ShowLocation()
-            {
-                //foreach (var p in ctf.CTFPlayers)
-                //{
-                //    p.player.SendConsoleCommand("ddraw.text", 2f, color, (carrier != null ? carrier.transform.position : flag.transform.position) + Vector3.up, $"<size=20>{ctf.GetTeamName(team)} {msg("flag")}</size>");
-                //}
-            }
-            private void SetupFlag()
-            {
-                flagState = FlagState.Collected;
-                flag.parentEntity.Set(carrier);
-                flag.transform.localPosition = new Vector3(0, 1.5f, 0);
-                flag.UpdateNetworkGroup();
-                flag.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
-            }
-            public void RestoreFlag(string name = null)
-            {
-                if (string.IsNullOrEmpty(name))
-                    ctf.SendMessage($"{ctf.configData.Messaging.MainColor}{ctf.GetTeamName(team)}'s</color>{ctf.configData.Messaging.MSGColor} {msg("flag has been returned to base!")}</color>");
-                else ctf.SendMessage($"{ctf.configData.Messaging.MainColor}{name}</color>{ctf.configData.Messaging.MSGColor} {msg("has returned")} </color>{ctf.configData.Messaging.MainColor}{ctf.GetTeamName(team)}'s</color>{ctf.configData.Messaging.MSGColor} {msg("flag to base")}!</color>");
-
-                carrier = null;
-                flag.parentEntity.Set(null);
-                flag.transform.localPosition = Vector3.zero;
-                flag.transform.position = homePos;
-                flag.UpdateNetworkGroup();
-                flag.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
-                flagState = FlagState.Stationary;                
-            }
-            public void DropFlag(Vector3 position)
-            {
-                carrier = null;
-                flag.parentEntity.Set(null);
-                flag.transform.localPosition = Vector3.zero;
-                flag.transform.position = position;
-                flag.UpdateNetworkGroup();
-                flag.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);                
-                flagState = FlagState.Stationary;
-                Invoke("AutoRestore", 30f);
-            }      
-            private void AutoRestore()
-            {
-                RestoreFlag();
-            }      
-        }
-        enum FlagState
-        {
-            Stationary,
-            Collected
-        }
-        #endregion
-
         #region Oxide Hooks
-        void Loaded()
-        {
-            hasStarted = false;
-            usingCTF = false;
-            CTFPlayers = new List<CTFPlayer>();
-            flagIDs = new Dictionary<Team, uint>();
-            lang.RegisterMessages(Messages, this);            
+        private void OnServerInitialized()
+        {      
+            EventManager.RegisterEvent(Title, this);
+
+            GetMessage = Message;
         }
 
-        void OnServerInitialized()
+        protected override void LoadDefaultMessages() => lang.RegisterMessages(Messages, this);
+
+        private object CanUpdateSign(BasePlayer player, Signage sign) => sign.GetComponentInParent<FlagController>() != null ? (object)true : null;
+
+        private void Unload()
         {
-            ctf = this;
-            LoadVariables();            
-            //RegisterGame();            
+            if (!EventManager.IsUnloading)
+                EventManager.UnregisterEvent(Title);
 
-            ScoreLimit = configData.GameSettings.ScoreLimit;
-
-            webObject = new GameObject("WebObject");
-            uWeb = webObject.AddComponent<UnityWeb>();
-            uWeb.Add(configData.TeamA.FlagImageURL, Team.A);
-            uWeb.Add(configData.TeamB.FlagImageURL, Team.B);
-        }
-        void RegisterGame()
-        {
-            EventManager.Events eventData = new EventManager.Events
-            {
-                CloseOnStart = false,
-                DisableItemPickup = false,
-                EnemiesToSpawn = 0,
-                EventType = Title,
-                GameMode = EventManager.GameMode.Normal,
-                GameRounds = 0,
-                Kit = configData.EventSettings.DefaultKit,
-                MaximumPlayers = 0,
-                MinimumPlayers = 2,
-                ScoreLimit = configData.GameSettings.ScoreLimit,
-                Spawnfile = configData.TeamA.Spawnfile,
-                Spawnfile2 = configData.TeamB.Spawnfile,
-                SpawnType = EventManager.SpawnType.Consecutive,
-                RespawnType = EventManager.RespawnType.Waves,
-                RespawnTimer = 30,
-                UseClassSelector = false,
-                WeaponSet = null,
-                ZoneID = configData.EventSettings.DefaultZoneID
-            };
-            EventManager.EventSetting eventSettings = new EventManager.EventSetting
-            {
-                CanChooseRespawn = true,
-                CanUseClassSelector = true,
-                CanPlayBattlefield = true,
-                ForceCloseOnStart = false,
-                IsRoundBased = false,
-                LockClothing = true,
-                RequiresKit = true,
-                RequiresMultipleSpawns = true,
-                RequiresSpawns = true,
-                ScoreType = msg("Flag Captures"),
-                SpawnsEnemies = false                
-            };
-            var success = EventManager?.RegisterEventGame(Title, eventSettings, eventData);
-            if (success == null)
-            {
-                Puts("Event plugin doesn't exist");
-                return;
-            }
-        }
-        private void OnEntityTakeDamage(BaseCombatEntity entity, HitInfo hitinfo)
-        {
-            if (usingCTF && hasStarted)
-            {
-                if (entity is Signage && entity.GetComponent<CTFFlag>())
-                {
-                    hitinfo.damageTypes = new DamageTypeList();
-                    hitinfo.DoHitEffects = false;
-                    return;
-                }
-                if (entity is BasePlayer && hitinfo?.Initiator is BasePlayer)
-                {
-                    var victim = entity?.GetComponent<CTFPlayer>();
-                    var attacker = hitinfo?.Initiator?.GetComponent<CTFPlayer>();
-                    if (victim != null && attacker != null && victim.player.userID != attacker.player.userID)
-                    {
-                        if (victim.team == attacker.team)
-                        {
-                            if (configData.GameSettings.FFDamageModifier <= 0)
-                            {
-                                hitinfo.damageTypes = new DamageTypeList();
-                                hitinfo.DoHitEffects = false;
-                            }
-                            else
-                                hitinfo.damageTypes.ScaleAll(configData.GameSettings.FFDamageModifier);
-                            SendReply(attacker.player, "Friendly Fire!");
-                        }
-                    }
-                }
-            }
-        }
-
-        void Unload()
-        {
-            if (usingCTF && hasStarted)
-                EventManager.EndEvent();
-
-            OnEventEndPre();
-
-            var objects = UnityEngine.Object.FindObjectsOfType<CTFPlayer>();
-            if (objects != null)
-                foreach (var gameObj in objects)
-                    UnityEngine.Object.Destroy(gameObj);
-
-            var flags = UnityEngine.Object.FindObjectsOfType<CTFFlag>();
-            if (flags != null)
-                foreach (var gameObj in flags)
-                    UnityEngine.Object.Destroy(gameObj);
-        }
-        object CanUpdateSign(BasePlayer player, Signage sign)
-        {
-            if (usingCTF && hasStarted)
-            {
-                if (sign == FlagA?.flag || sign == FlagB?.flag)
-                    return false;
-            }
-            return null;
+            Configuration = null;
         }
         #endregion
 
-        #region UI
-        #region Scoreboard        
-        private void UpdateScores()
-        {
-            if (usingCTF && hasStarted && configData.EventSettings.ShowScoreboard)
-            {
-                var sortedList = CTFPlayers.OrderByDescending(pair => pair.caps).ToList();
-                var scoreList = new Dictionary<ulong, EventManager.Scoreboard>();
-                foreach (var entry in sortedList)
-                {
-                    if (scoreList.ContainsKey(entry.player.userID)) continue;
-                    scoreList.Add(entry.player.userID, new EventManager.Scoreboard { Name = entry.player.displayName, Position = sortedList.IndexOf(entry), Score = entry.caps });
-                }
-                EventManager.UpdateScoreboard(new EventManager.ScoreData { Additional = $"{ctf.GetTeamName(Team.A)} : <color={configData.TeamA.Color}>{ACaps}</color> || {ctf.GetTeamName(Team.B)} : <color={configData.TeamB.Color}>{BCaps}</color>", Scores = scoreList, ScoreType = msg("Flags") });
-            }
-        }
-        #endregion
+        #region Event Checks
+        public bool InitializeEvent(EventManager.EventConfig config) => EventManager.InitializeEvent<CaptureTheFlagEvent>(this, config);
 
-        #endregion
+        public bool CanUseClassSelector => true;
 
-        #region CTF Functions        
-        void AddFlag(Team team)
-        {
-            string spawnFile = team == Team.A ? TeamASpawns : TeamBSpawns;            
+        public bool RequireTimeLimit => true;
 
-            var spawnPoint = Spawns.Call("GetSpawn", spawnFile, 0);
-            if (spawnPoint is string)
-            {
-                PrintError((string)spawnPoint);
-                return;
-            }
-            else
-            {
-                CTFFlag ctfFlag = new GameObject().gameObject.AddComponent<CTFFlag>();                            
-                ctfFlag.InitializeFlag(team, (Vector3)spawnPoint);
-                if (team == Team.A) FlagA = ctfFlag;
-                else FlagB = ctfFlag;
-            }
-        }
-        void AddCapturePoint(BasePlayer player, Team team)
-        {
-            EventManager.AddTokens(player.userID, configData.EventSettings.TokensOnFlagCapture, true);
-            if (team == Team.A) ACaps++;
-            else BCaps++;
-            UpdateScores();
-            CheckScores();
-        }        
-        void RemovePlayer(CTFPlayer player)
-        {
-            if (player.hasFlag)
-            {
-                CTFFlag flag = player.team == Team.A ? FlagB : FlagA;
-               
-                flag.DropFlag(player.transform.position);
-                player.player.SendNetworkUpdate();
-                player.hasFlag = false;
-                SendMessage($"{ctf.configData.Messaging.MainColor}{player.player.displayName}</color>{ctf.configData.Messaging.MSGColor} {msg("has dropped")} </color>{ctf.configData.Messaging.MainColor}{ctf.GetTeamName(flag.team)}'s</color>{ctf.configData.Messaging.MSGColor} {msg("flag")}!</color>");
-            }            
-        }        
-        #endregion
+        public bool RequireScoreLimit => false;
 
-        #region Event Manager Hooks
-        void OnSelectEventGamePost(string name)
+        public bool UseScoreLimit => true;
+
+        public bool UseTimeLimit => true;
+
+        public bool IsTeamEvent => true;
+
+        public void FormatScoreEntry(EventManager.ScoreEntry scoreEntry, ulong langUserId, out string score1, out string score2)
         {
-            if (Title == name)            
-                usingCTF = true;            
-            else usingCTF = false;
-        }
-        object CanEventOpen()
-        {
-            if (usingCTF)
-            {
-                object count = Spawns.Call("GetSpawnsCount", TeamASpawns);
-                if (count is int && (int)count <= 1)
-                    return "Team A spawnfile does not have enough spawnpoints";
-                count = Spawns.Call("GetSpawnsCount", TeamBSpawns);
-                if (count is int && (int)count <= 1)
-                    return "Team B spawnfile does not have enough spawnpoints";
-            }
-            return null;
-        }
-        void OnEventPlayerSpawn(BasePlayer player)
-        {
-            if (usingCTF && hasStarted && !gameEnding)
-            {
-                if (!player.GetComponent<CTFPlayer>()) return;
-                if (player.IsSleeping())
-                {
-                    player.EndSleeping();
-                    timer.In(1, () => OnEventPlayerSpawn(player));
-                    return;
-                }
-                EventManager.GivePlayerKit(player, Kit);
-                player.health = configData.GameSettings.StartHealth;
-            }
-        }
-        private void OnEventKitGiven(BasePlayer player)
-        {
-            if (usingCTF)
-            {
-                GiveTeamShirts(player);
-            }
-        }
-        object OnEventOpenPost()
-        {
-            if (usingCTF)  
-                EventManager.BroadcastEvent(msg("description"));            
-            return null;
-        }
-        object OnEventCancel()
-        {
-            if (usingCTF && hasStarted)
-            {
-                FlagA.RestoreFlag();
-                FlagB.RestoreFlag();
-                UnityEngine.Object.Destroy(FlagA);
-                UnityEngine.Object.Destroy(FlagB);
-                CheckScores(true);
-            }
-            return null;
+            score1 = string.Format(Message("Score.FlagCaptures", langUserId), scoreEntry.value1);
+            score2 = string.Format(Message("Score.Kills", langUserId), scoreEntry.value2);
         }
 
-        void OnEventEndPre()
-        {
-            if (usingCTF && hasStarted)
-            {
-                FlagA.RestoreFlag();
-                FlagB.RestoreFlag();
-                UnityEngine.Object.Destroy(FlagA);
-                UnityEngine.Object.Destroy(FlagB);
-                CheckScores(true);
-            }
-        }
-        object OnEventEndPost()
-        {
-            if (usingCTF)
-            {                
-                hasStarted = false;
-                
-                var ctfPlayers = UnityEngine.Object.FindObjectsOfType<CTFPlayer>();
-                if (ctfPlayers != null)
-                {
-                    foreach (var ctfplayer in ctfPlayers)
-                        UnityEngine.Object.Destroy(ctfplayer);
-                }
-                CTFPlayers.Clear();
-            }
-            return null;
-        }
-        object OnEventStartPre()
-        {
-            if (usingCTF)
-            {
-                hasStarted = true;
-                gameEnding = false;
-                ACaps = 0;
-                BCaps = 0;                
-            }
-            return null;
-        }
-        object OnEventStartPost()
-        {
-            if (usingCTF)
-            {
-                AddFlag(Team.A);
-                AddFlag(Team.B);
-                UpdateScores();
-            }
-            return null;
-        }
-        object OnSelectKit(string kitname)
-        {
-            if (usingCTF)
-            {
-                Kit = kitname;
-                return true;
-            }
-            return null;
-        }       
-        object OnEventJoinPost(BasePlayer player)
-        {
-            if (usingCTF)
-            {
-                if (player.GetComponent<CTFPlayer>())
-                    UnityEngine.Object.Destroy(player.GetComponent<CTFPlayer>());
-                CTFPlayers.Add(player.gameObject.AddComponent<CTFPlayer>());
-                TeamAssign(player);
-                EventManager.CreateScoreboard(player);
-            }
-            return null;
-        }
-        object OnEventLeavePost(BasePlayer player)
-        {
-            if (usingCTF)
-            {
-                if (player.GetComponent<CTFPlayer>())
-                {                    
-                    RemovePlayer(player.GetComponent<CTFPlayer>());
-                    CTFPlayers.Remove(player.GetComponent<CTFPlayer>());
-                    UnityEngine.Object.Destroy(player.GetComponent<CTFPlayer>());
-                    CheckScores();
-                }
-            }            
-            return null;
-        }
-        void OnEventPlayerAttack(BasePlayer attacker, HitInfo hitinfo)
-        {
-            if (usingCTF)
-            {
-                if (!(hitinfo.HitEntity is BasePlayer))
-                {
-                    hitinfo.damageTypes = new DamageTypeList();
-                    hitinfo.DoHitEffects = false;
-                }
-            }
-        }
-
-        void OnEventPlayerDeath(BasePlayer victim, HitInfo hitinfo)
-        {
-            if (usingCTF)
-            {
-                if (victim.GetComponent<CTFPlayer>())
-                {
-                    RemovePlayer(victim.GetComponent<CTFPlayer>());
-                    var vicPlayer = victim.GetComponent<CTFPlayer>();
-                    BasePlayer attacker = hitinfo?.Initiator?.ToPlayer();
-                    if (attacker != null)
-                    {
-                        if (attacker != victim)
-                        {                            
-                            AddKill(attacker, victim);
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        object EventChooseSpawn(BasePlayer player, Vector3 destination)
-        {
-            if (usingCTF)
-            {
-                if (!CheckForTeam(player))
-                {
-                    TeamAssign(player);
-                    return false;
-                }
-                Team team = player.GetComponent<CTFPlayer>().team;
-                
-                var spawnPos = EventManager.SpawnCount.GetSpawnPoint(team == Team.A ? TeamASpawns : TeamBSpawns, team == Team.A, 1); 
-                if (spawnPos is string)
-                {
-                    PrintError((string)spawnPos);
-                    return null;
-                }
-                else return (Vector3)spawnPos;
-            }
-            return null;
-        }
-        void SetSpawnfile(bool isTeamA, string spawnfile)
-        {
-            if (isTeamA)
-                TeamASpawns = spawnfile;
-            else TeamBSpawns = spawnfile;
-        }
-        void SetScoreLimit(int scoreLimit) => ScoreLimit = scoreLimit;
-        #endregion
-
-        #region Teams
-        enum Team
-        {
-            NONE,
-            A,
-            B
-        }
-        private bool CheckForTeam(BasePlayer player)
-        {
-            if (!player.GetComponent<CTFPlayer>())
-                CTFPlayers.Add(player.gameObject.AddComponent<CTFPlayer>());
-            if (player.GetComponent<CTFPlayer>().team == Team.NONE)
-                return false;
-            return true;
-        }
-        private void TeamAssign(BasePlayer player)
-        {
-            if (usingCTF && hasStarted)
-            {
-                Team team = CountForBalance();
-                if (player.GetComponent<CTFPlayer>().team == Team.NONE)
-                {
-                    player.GetComponent<CTFPlayer>().team = team;
-                    string color = team == Team.A ? configData.TeamA.Color : configData.TeamB.Color;
-                    SendReply(player, string.Format(msg("teamAssign", player.UserIDString), GetTeamName(team, player.UserIDString), color));
-                    //player.Respawn();
-                }
-            }
-        }
-
-        private string GetTeamName(Team team, string id = null)
-        {
-            switch (team)
-            {
-                case Team.A:
-                    return Msg("TeamA", id);
-                case Team.B:
-                    return Msg("TeamB", id);
-                default:
-                    return Msg("TeamNone", id);
-            }
-        }
-        private Team CountForBalance()
-        {
-            Team PlayerNewTeam;
-            int aCount = Count(Team.A);
-            int bCount = Count(Team.B);
-
-            if (aCount > bCount) PlayerNewTeam = Team.B;
-            else PlayerNewTeam = Team.A;
-
-            return PlayerNewTeam;
-        }
-        private int Count(Team team)
-        {
-            int count = 0;
-            foreach (var player in CTFPlayers)
-            {
-                if (player.team == team) count++;
-            }
-            return count;
-        }
-        private void GiveTeamShirts(BasePlayer player)
+        public List<EventManager.EventParameter> AdditionalParameters { get; } = new List<EventManager.EventParameter>
         {            
-            if (player.GetComponent<CTFPlayer>().team == Team.A)
+            new EventManager.EventParameter
             {
-                foreach(var item in configData.TeamA.ClothingItems)
-                {
-                    Item clothing = ItemManager.CreateByPartialName(item.Key);
-                    clothing.skin = item.Value;
-                    clothing.MoveToContainer(player.inventory.containerWear);
-                }                            
-            }
-            else if (player.GetComponent<CTFPlayer>().team == Team.B)
-            {
-                foreach (var item in configData.TeamB.ClothingItems)
-                {
-                    Item clothing = ItemManager.CreateByPartialName(item.Key);
-                    clothing.skin = item.Value;
-                    clothing.MoveToContainer(player.inventory.containerWear);
-                }
-            }
-        }
-        public static Color HexToColor(string hexColor)
-        {
-            if (hexColor.IndexOf('#') != -1)
-                hexColor = hexColor.Replace("#", "");
+                DataType = "int",
+                Field = "flagRespawnTimer",
+                Input = EventManager.EventParameter.InputType.InputField,               
+                IsRequired = true,
+                Name = "Flag Reset Time",
+                DefaultValue = 30
+            },
+        };
 
-            int red = 0;
-            int green = 0;
-            int blue = 0;
-
-            if (hexColor.Length == 6)
-            {
-                red = int.Parse(hexColor.Substring(0, 2), NumberStyles.AllowHexSpecifier);
-                green = int.Parse(hexColor.Substring(2, 2), NumberStyles.AllowHexSpecifier);
-                blue = int.Parse(hexColor.Substring(4, 2), NumberStyles.AllowHexSpecifier);
-            }
-            else if (hexColor.Length == 3)
-            {
-                red = int.Parse(hexColor[0].ToString() + hexColor[0].ToString(), NumberStyles.AllowHexSpecifier);
-                green = int.Parse(hexColor[1].ToString() + hexColor[1].ToString(), NumberStyles.AllowHexSpecifier);
-                blue = int.Parse(hexColor[2].ToString() + hexColor[2].ToString(), NumberStyles.AllowHexSpecifier);
-            }
-
-            return new Color(((float)red) / 100f, ((float)green) / 100f, ((float)blue) / 100f);
-        }
-        string Msg(string key, string userId) => lang.GetMessage(key, this, userId);
-        void SendMessage(string message)
-        {
-            if (configData.EventSettings.UseUINotifications)
-                EventManager.PopupMessage(message);
-            else PrintToChat(message);
-        }
+        public string ParameterIsValid(string fieldName, object value) => null;
         #endregion
 
-        #region Scoring
-        void AddKill(BasePlayer player, BasePlayer victim)
+        #region Event Classes
+        public class CaptureTheFlagEvent : EventManager.BaseEventGame
         {
-            if (!player.GetComponent<CTFPlayer>())
-                return;
-                        
-            EventManager.AddTokens(player.userID, configData.EventSettings.TokensOnKill);
-            EventManager.BroadcastEvent(string.Format(msg("killMsg"), player.displayName, victim.displayName));            
-        }
-        void CheckScores(bool timelimit = false)
-        {
-            if (gameEnding) return;
-            if (CTFPlayers.Count == 0)
-            {
-                gameEnding = true;
-                EventManager.BroadcastToChat(msg("noPlayers"));
-                EventManager.CloseEvent();
-                EventManager.EndEvent();
-                return;
-            }
-            if (CTFPlayers.Count == 1)
-            {
-                Winner(CTFPlayers[0].team);
-                return;
-            }
-            if (timelimit)
-            {
-                if (ACaps > BCaps) Winner(Team.A);
-                else if (BCaps > ACaps) Winner(Team.B);
-                else if (ACaps == BCaps) Winner(Team.NONE);
-                return;
-            }
-            if (EventManager._Event.GameMode == EventManager.GameMode.Battlefield)
-                return;
+            public EventManager.Team winningTeam;
 
-            if (ScoreLimit > 0)
+            internal int flagRespawnTime;
+
+            private int teamAScore;
+            private int teamBScore;
+            
+            private EventManager.Team lastTeam = EventManager.Team.B;
+
+            internal FlagController TeamAFlag { get; private set; }
+
+            internal FlagController TeamBFlag { get; private set; }
+
+            internal override void InitializeEvent(IEventPlugin plugin, EventManager.EventConfig config)
             {
-                if (ACaps >= ScoreLimit)
-                    Winner(Team.A);
-                else if (BCaps >= ScoreLimit)
-                    Winner(Team.B);
+                flagRespawnTime = config.GetParameter<int>("flagRespawnTimer");
+
+                base.InitializeEvent(plugin, config);
+
+                TeamAFlag = FlagController.Create(this, EventManager.Team.A, _spawnSelectorA.ReserveSpawnPoint(0));
+                TeamBFlag = FlagController.Create(this, EventManager.Team.B, _spawnSelectorB.ReserveSpawnPoint(0));
             }
-        }
-        void Winner(Team team)
-        {
-            gameEnding = true;
-            foreach (var member in CTFPlayers)
+
+            protected override void StartEvent()
             {
-                if (member.hasFlag)
+                BalanceTeams();
+                base.StartEvent();
+            }
+
+            internal override void EndEvent()
+            {
+                TeamAFlag.DropFlag(false);
+                TeamBFlag.DropFlag(false);
+                
+                base.EndEvent();
+            }
+
+            protected override void OnDestroy()
+            {
+                Destroy(TeamAFlag);
+                Destroy(TeamBFlag);
+
+                base.OnDestroy();
+            }
+
+            protected override EventManager.BaseEventPlayer AddPlayerComponent(BasePlayer player) => player.gameObject.AddComponent<CaptureTheFlagPlayer>();
+             
+            protected override EventManager.Team GetPlayerTeam(BasePlayer player) => lastTeam = lastTeam == EventManager.Team.B ? EventManager.Team.A : EventManager.Team.B;
+
+            internal override int GetTeamScore(EventManager.Team team) => team == EventManager.Team.B ? teamBScore : teamAScore;
+
+            internal override void OnEventPlayerDeath(EventManager.BaseEventPlayer victim, EventManager.BaseEventPlayer attacker = null, HitInfo info = null)
+            {
+                if (victim == null)
+                    return;
+
+                if ((victim as CaptureTheFlagPlayer).IsCarryingFlag)
                 {
-                    CTFFlag flag = member.team == Team.A ? FlagB : FlagA;                    
+                    FlagController flagController = victim.Team == EventManager.Team.B ? TeamAFlag : TeamBFlag;
+                    if (flagController.FlagHolder == victim)
+                    {
+                        flagController.DropFlag(true);
+                        BroadcastToPlayers(GetMessage, "Notification.FlagDropped", victim.Player.displayName, flagController.Team, GetTeamColor(victim.Team), GetTeamColor(flagController.Team));
+                    }
+                }
 
-                    flag.DropFlag(member.transform.position);
-                    member.player.SendNetworkUpdate();
-                    member.hasFlag = false;
-                } 
-                if (member.team == team)
-                    EventManager.AddTokens(member.player.userID, configData.EventSettings.TokensOnWin, true);
+                victim.OnPlayerDeath(attacker, Configuration.RespawnTime);
+
+                if (attacker != null && victim != attacker && victim.Team != attacker.Team)                                  
+                    attacker.OnKilledPlayer(info);
+
+                UpdateScoreboard();
+                base.OnEventPlayerDeath(victim, attacker);
             }
-            if (team == Team.NONE)
-                EventManager.BroadcastToChat(msg("draw"));
-            else EventManager.BroadcastToChat(string.Format(msg("winner"), GetTeamName(team)));
-            timer.In(2, ()=> 
+
+            protected override void GetWinningPlayers(ref List<EventManager.BaseEventPlayer> winners)
             {
-                EventManager.CloseEvent();
-                EventManager.EndEvent();
-            });
+                if (winningTeam != EventManager.Team.None)
+                {
+                    if (eventPlayers.Count > 0)
+                    {
+                        for (int i = 0; i < eventPlayers.Count; i++)
+                        {
+                            EventManager.BaseEventPlayer eventPlayer = eventPlayers[i];
+                            if (eventPlayer == null)
+                                continue;
+
+                            if (eventPlayer.Team == winningTeam)
+                                winners.Add(eventPlayer);
+                        }
+                    }
+                }
+            }
+
+            internal void OnFlagCaptured(CaptureTheFlagPlayer eventPlayer, EventManager.Team team)
+            {
+                int flagCaptures;
+
+                if (eventPlayer.Team == EventManager.Team.B)
+                    flagCaptures = teamBScore += 1;
+                else flagCaptures = teamAScore += 1;
+
+                eventPlayer.FlagCaptures += 1;
+
+                BroadcastToPlayers(GetMessage, "Notification.FlagCaptured", eventPlayer.Player.displayName, team, GetTeamColor(eventPlayer.Team), GetTeamColor(team));                
+
+                UpdateScoreboard();
+
+                if (flagCaptures >= Config.ScoreLimit)
+                {
+                    winningTeam = eventPlayer.Team;
+                    InvokeHandler.Invoke(this, EndEvent, 0.1f);
+                }
+            }
+
+            internal string GetTeamColor(EventManager.Team team) => team == EventManager.Team.B ? TeamBColor : TeamAColor;
+
+            #region Scoreboards
+            protected override void BuildScoreboard()
+            {
+                scoreContainer = EMInterface.CreateScoreboardBase(this);
+
+                int index = -1;
+                EMInterface.CreatePanelEntry(scoreContainer, string.Format(GetMessage("Score.Team", 0UL), teamAScore, TeamAColor, TeamBColor, teamBScore), index += 1);
+
+                if (Config.ScoreLimit > 0)
+                    EMInterface.CreatePanelEntry(scoreContainer, string.Format(GetMessage("Score.Limit", 0UL), Config.ScoreLimit), index += 1);
+
+                EMInterface.CreateScoreEntry(scoreContainer, string.Empty, "C", "K", index += 1);
+
+                for (int i = 0; i < Mathf.Min(scoreData.Count, 15); i++)
+                {
+                    EventManager.ScoreEntry score = scoreData[i];
+                    EMInterface.CreateScoreEntry(scoreContainer, $"<color={(score.team == EventManager.Team.A ? TeamAColor : TeamBColor)}>{score.displayName}</color>", ((int)score.value1).ToString(), ((int)score.value2).ToString(), i + index + 1);
+                }
+            }
+
+            protected override float GetFirstScoreValue(EventManager.BaseEventPlayer eventPlayer) => (eventPlayer as CaptureTheFlagPlayer).FlagCaptures;
+
+            protected override float GetSecondScoreValue(EventManager.BaseEventPlayer eventPlayer) => eventPlayer.Kills;
+
+            protected override void SortScores(ref List<EventManager.ScoreEntry> list)
+            {
+                list.Sort(delegate (EventManager.ScoreEntry a, EventManager.ScoreEntry b)
+                {
+                    int primaryScore = a.value1.CompareTo(b.value1);
+
+                    if (primaryScore == 0)
+                        return a.value2.CompareTo(b.value2);
+
+                    return primaryScore;
+                });
+            }
+            #endregion
+        }
+
+        internal class CaptureTheFlagPlayer : EventManager.BaseEventPlayer
+        {
+            public int FlagCaptures { get; set; }
+
+            public bool IsCarryingFlag { get; set; }
+        }
+
+        internal class FlagController : MonoBehaviour
+        {
+            private Signage primary;
+            private Signage secondary;
+
+            private Transform tr;
+
+            private Vector3 basePosition;
+            private BoxCollider boxCollider;
+
+            private uint signImageCRC = 0;
+
+            private CaptureTheFlagEvent captureTheFlagEvent;
+
+            internal EventManager.Team Team { get; set; }
+
+            internal CaptureTheFlagPlayer FlagHolder { get; private set; }
+
+            internal bool IsAtBase { get; private set; } = true;
+
+            private const string SIGN_PREFAB = "assets/prefabs/deployable/signs/sign.post.single.prefab";
+
+            private const float ROTATE_SPEED = 48f;
+
+            internal static FlagController Create(CaptureTheFlagEvent captureTheFlagEvent, EventManager.Team team, Vector3 position)
+            {                
+                Signage signage = Spawn(position);
+                FlagController flagController = signage.gameObject.AddComponent<FlagController>();
+
+                flagController.captureTheFlagEvent = captureTheFlagEvent;
+                flagController.Team = team;
+                flagController.basePosition = position;
+
+                return flagController;
+            }
+
+            private static Signage Spawn(Vector3 position)
+            {
+                Signage signage = GameManager.server.CreateEntity(SIGN_PREFAB, position) as Signage;
+                signage.enableSaving = false;
+                signage.Spawn();
+
+                Destroy(signage.GetComponent<MeshCollider>());
+                Destroy(signage.GetComponent<DestroyOnGroundMissing>());
+                Destroy(signage.GetComponent<GroundWatch>());
+
+                return signage;
+            }
+
+            private void Awake()
+            {
+                primary = GetComponent<Signage>();
+                tr = primary.transform;
+            }
+
+            private void Start()
+            {
+                secondary = Spawn(tr.position);
+                
+                secondary.SetParent(primary);
+                secondary.transform.localPosition = Vector3.zero;
+                secondary.transform.localRotation = Quaternion.Euler(0f, 180f, 0f);
+
+                SetSignImages(primary);
+                SetSignImages(secondary);
+
+                primary.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
+                secondary.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
+
+                primary.gameObject.layer = (int)Rust.Layer.Reserved1;
+
+                boxCollider = primary.gameObject.AddComponent<BoxCollider>();
+                boxCollider.size = new Vector3(1.2f, 2f, 1f);
+                boxCollider.center = new Vector3(0f, 1.1f, 0f);
+                boxCollider.isTrigger = true;
+            }
+
+            private void Update()
+            {
+                tr.RotateAround(tr.position, tr.up, Time.deltaTime * ROTATE_SPEED);
+                primary.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
+            }
+
+            private void OnDestroy()
+            {
+                Destroy(boxCollider);
+
+                if (secondary != null && !secondary.IsDestroyed)
+                {
+                    secondary.SetParent(null);
+                    secondary.Kill(BaseNetworkable.DestroyMode.None);
+                }
+
+                if (primary != null && !primary.IsDestroyed)
+                {
+                    primary.SetParent(null);
+                    primary.Kill();
+                }
+            }
+
+            private void SetSignImages(Signage signage)
+            {
+                string hex = Team == EventManager.Team.B ? captureTheFlagEvent.TeamBColor : captureTheFlagEvent.TeamAColor;
+
+                if (signImageCRC == 0)
+                {
+                    hex = hex.TrimStart('#');
+
+                    int red = int.Parse(hex.Substring(0, 2), NumberStyles.AllowHexSpecifier);
+                    int green = int.Parse(hex.Substring(2, 2), NumberStyles.AllowHexSpecifier);
+                    int blue = int.Parse(hex.Substring(4, 2), NumberStyles.AllowHexSpecifier);
+
+                    Color color = new Color((float)red / 255f, (float)green / 255f, (float)blue / 255f);
+
+                    Color[] array = new Color[256 * 256];
+                    for (int i = 0; i < array.Length; i++)
+                        array[i] = color;
+
+                    Texture2D texture2D = new Texture2D(256, 256);
+                    texture2D.SetPixels(array);
+                    byte[] bytes = texture2D.EncodeToPNG();
+
+                    Destroy(texture2D);
+
+                    signImageCRC = FileStorage.server.Store(bytes, FileStorage.Type.png, CommunityEntity.ServerInstance.net.ID);
+                }
+
+                Array.Resize<uint>(ref signage.textureIDs, 1);
+
+                signage.textureIDs[0] = signImageCRC;
+                signage.SetFlag(BaseEntity.Flags.Locked, true);
+            }
+            
+            private void OnTriggerEnter(Collider col)
+            {
+                if (captureTheFlagEvent.Status != EventManager.EventStatus.Started)
+                    return;
+
+                CaptureTheFlagPlayer eventPlayer = col.GetComponent<CaptureTheFlagPlayer>();
+                if (eventPlayer == null || eventPlayer.IsDead)
+                    return;
+
+                if (IsAtBase)
+                {
+                    if (eventPlayer.Team != Team)                    
+                        PickupFlag(eventPlayer);                    
+                    else
+                    {
+                        if (eventPlayer.IsCarryingFlag)
+                        {
+                            FlagController enemyFlag = Team == EventManager.Team.A ? captureTheFlagEvent.TeamBFlag : captureTheFlagEvent.TeamAFlag;
+                            enemyFlag.CaptureFlag(eventPlayer);
+                        }
+                    }
+                }
+                else
+                {
+                    if (FlagHolder == null)
+                    {
+                        if (eventPlayer.Team != Team)                        
+                            PickupFlag(eventPlayer);                        
+                        else
+                        {
+                            ResetFlag();
+                            captureTheFlagEvent.BroadcastToPlayers(GetMessage, "Notification.FlagReset", eventPlayer.Team, captureTheFlagEvent.GetTeamColor(eventPlayer.Team));
+                        }
+                    }
+                }
+            }
+
+            private void PickupFlag(CaptureTheFlagPlayer eventPlayer)
+            {
+                FlagHolder = eventPlayer;
+                eventPlayer.IsCarryingFlag = true;
+
+                IsAtBase = false;
+                InvokeHandler.CancelInvoke(this, DroppedTimeExpired);
+
+                primary.SetParent(eventPlayer.Player);
+                tr.localPosition = new Vector3(0f, 0.25f, -0.75f);
+
+                captureTheFlagEvent.BroadcastToPlayers(GetMessage, "Notification.FlagPickedUp", eventPlayer.Player.displayName, Team, captureTheFlagEvent.GetTeamColor(eventPlayer.Team), captureTheFlagEvent.GetTeamColor(Team));
+            }
+
+            internal void DropFlag(bool resetToBase)
+            {                
+                primary.SetParent(null, true);
+
+                if (FlagHolder != null)
+                {
+                    FlagHolder.IsCarryingFlag = false;
+                    FlagHolder = null;
+                }
+
+                primary.UpdateNetworkGroup();
+                primary.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
+
+                if (resetToBase)
+                    InvokeHandler.Invoke(this, DroppedTimeExpired, captureTheFlagEvent.flagRespawnTime);
+            }
+
+            private void CaptureFlag(CaptureTheFlagPlayer eventPlayer)
+            {
+                ResetFlag();
+                captureTheFlagEvent.OnFlagCaptured(eventPlayer, Team);                
+            }
+
+            private void DroppedTimeExpired()
+            {
+                captureTheFlagEvent.BroadcastToPlayers(GetMessage, "Notification.FlagReset", Team, captureTheFlagEvent.GetTeamColor(Team));
+                ResetFlag();
+            }
+
+            private void ResetFlag()
+            {
+                if (FlagHolder != null)
+                {
+                    FlagHolder.IsCarryingFlag = false;
+                    FlagHolder = null;
+                }
+
+                InvokeHandler.CancelInvoke(this, DroppedTimeExpired);
+
+                primary.SetParent(null);
+
+                tr.position = basePosition;
+
+                primary.UpdateNetworkGroup();
+                primary.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
+
+                IsAtBase = true;
+            }
         }
         #endregion
 
         #region Config        
-        private ConfigData configData;
-        class EventSettings
+        private static ConfigData Configuration;
+
+        private class ConfigData
         {
-            public string DefaultKit { get; set; }
-            public string DefaultZoneID { get; set; }
-            public int TokensOnKill { get; set; }
-            public int TokensOnWin { get; set; }
-            public int TokensOnFlagCapture { get; set; }
-            public bool ShowScoreboard { get; set; }
-            public bool UseUINotifications { get; set; }
+            [JsonProperty(PropertyName = "Respawn time (seconds)")]
+            public int RespawnTime { get; set; }
+
+            public Oxide.Core.VersionNumber Version { get; set; }
         }
-        class GameSettings
+
+        protected override void LoadConfig()
         {
-            public float StartHealth { get; set; }
-            public float FFDamageModifier { get; set; }
-            public int ScoreLimit { get; set; }
-            public string FlagType { get; set; }
-            public float FlagMarkerRefreshRate { get; set; }            
+            base.LoadConfig();
+            Configuration = Config.ReadObject<ConfigData>();
+
+            if (Configuration.Version < Version)
+                UpdateConfigValues();
+
+            Config.WriteObject(Configuration, true);
         }
-        class TeamSettings
+
+        protected override void LoadDefaultConfig() => Configuration = GetBaseConfig();
+
+        private ConfigData GetBaseConfig()
         {
-            public Dictionary<string, ulong> ClothingItems { get; set; }           
-            public string Color { get; set; }
-            public string Spawnfile { get; set; }
-            public string FlagImageURL { get; set; }
-        }
-        class Messaging
-        {
-            public string MainColor { get; set; }
-            public string MSGColor { get; set; }
-        }
-        class ConfigData
-        {
-            public EventSettings EventSettings { get; set; }
-            public GameSettings GameSettings { get; set; }
-            public TeamSettings TeamA { get; set; }
-            public TeamSettings TeamB { get; set; }
-            public Messaging Messaging { get; set; }
-        }
-        private void LoadVariables()
-        {
-            LoadConfigVariables();
-            SaveConfig();
-        }
-        protected override void LoadDefaultConfig()
-        {
-            var config = new ConfigData
+            return new ConfigData
             {
-                EventSettings = new EventSettings
-                {
-                    DefaultKit = "ctfkit",
-                    DefaultZoneID = "ctfzone",
-                    TokensOnKill = 1,
-                    TokensOnFlagCapture = 2,
-                    TokensOnWin = 5,
-                    ShowScoreboard = true,
-                    UseUINotifications = true
-                },
-                GameSettings = new GameSettings
-                {
-                    StartHealth = 100,
-                    FFDamageModifier = 0.25f,
-                    ScoreLimit = 5,
-                    FlagType = "assets/prefabs/deployable/signs/sign.post.double.prefab",
-                    FlagMarkerRefreshRate = 2f
-                },
-                TeamA = new TeamSettings
-                {
-                    Color = "#33CC33",
-                    ClothingItems = new Dictionary<string, ulong>
-                    {
-                        { "tshirt", 0 }
-                    },                   
-                    Spawnfile = "CTF_ASpawns",
-                    FlagImageURL = "https://kienforcefidele.files.wordpress.com/2011/08/green-square-copy.jpg"
-                },
-                TeamB = new TeamSettings
-                {
-                    Color = "#003366",
-                    ClothingItems = new Dictionary<string, ulong>
-                    {
-                        { "tshirt", 14177 }
-                    },                   
-                    Spawnfile = "CTF_BSpawns",
-                    FlagImageURL = "http://www.polyvore.com/cgi/img-thing?.out=jpg&size=l&tid=19393880"
-                },
-                Messaging = new Messaging
-                {
-                    MainColor = "<color=orange>",
-                    MSGColor = "<color=#939393>"
-                }
+                RespawnTime = 5,
+                Version = Version
             };
-            SaveConfig(config);
         }
-        private void LoadConfigVariables() => configData = Config.ReadObject<ConfigData>();
-        void SaveConfig(ConfigData config) => Config.WriteObject(config, true);
-        #endregion
 
-        #region Unity WWW
-        class QueueItem
+        protected override void SaveConfig() => Config.WriteObject(Configuration, true);
+
+        private void UpdateConfigValues()
         {
-            public string url;
-            public Team team;
-            public QueueItem(string ur, Team te)
-            {
-                url = ur;
-                team = te;
-            }
+            PrintWarning("Config update detected! Updating config values...");
+
+            Configuration.Version = Version;
+            PrintWarning("Config update completed!");
         }
-        class UnityWeb : MonoBehaviour
-        {
-            CaptureTheFlag filehandler;
-            const int MaxActiveLoads = 3;
-            private Queue<QueueItem> QueueList = new Queue<QueueItem>();
-            static byte activeLoads;
-            private MemoryStream stream = new MemoryStream();
 
-            private void Awake()
-            {
-                filehandler = (CaptureTheFlag)Interface.Oxide.RootPluginManager.GetPlugin(nameof(CaptureTheFlag));
-            }
-            private void OnDestroy()
-            {
-                QueueList.Clear();
-                filehandler = null;
-            }
-            public void Add(string url, Team team)
-            {
-                QueueList.Enqueue(new QueueItem(url, team));
-                if (activeLoads < MaxActiveLoads) Next();
-            }
-
-            void Next()
-            {
-                if (QueueList.Count <= 0) return;
-                activeLoads++;
-                StartCoroutine(WaitForRequest(QueueList.Dequeue()));
-            }
-            private void ClearStream()
-            {
-                stream.Position = 0;
-                stream.SetLength(0);
-            }
-
-            IEnumerator WaitForRequest(QueueItem info)
-            {
-                using (var www = new WWW(info.url))
-                {
-                    yield return www;
-                    if (filehandler == null) yield break;
-                    if (www.error != null)
-                    {
-                        print(string.Format("Image loading fail! Error: {0}", www.error));
-                    }
-                    else
-                    {
-
-                        ClearStream();
-                        stream.Write(www.bytes, 0, www.bytes.Length);
-                        uint textureID = FileStorage.server.Store(stream, FileStorage.Type.png, CommunityEntity.ServerInstance.net.ID);
-                        ClearStream();
-                        if (!filehandler.flagIDs.ContainsKey(info.team))
-                            filehandler.flagIDs.Add(info.team, textureID);
-                    }
-                    activeLoads--;
-                    if (QueueList.Count > 0) Next();                    
-                }
-            }
-        }
         #endregion
 
         #region Localization
-        static string msg(string key, string playerId = null) => ctf.lang.GetMessage(key, ctf, playerId);
-        Dictionary<string, string> Messages = new Dictionary<string, string>
+        public string Message(string key, ulong playerId = 0U) => lang.GetMessage(key, this, playerId != 0U ? playerId.ToString() : null);
+
+        private static Func<string, ulong, string> GetMessage;
+
+        private readonly Dictionary<string, string> Messages = new Dictionary<string, string>
         {
-            {"has taken", "has taken" },
-            {"has dropped", "has dropped" },
-            {"has captured", "has captured" },
-            {"has returned", "has returned" },
-            {"flag to base", "flag to base" },
-            {"Flags", "Flags" },
-            {"flag", "flag" },
-            {"flag has been returned to base!", "flag has been returned to base!"},
-            {"Flag Captures","Flag Captures" },
-            {"description", "Capture the enemys flag and return it to your base to earn points" },
-            {"teamAssign", "You have been assigned to team <color={1}>{0}</color>" },
-            {"TeamA", "Team A" },
-            {"TeamB", "Team B" },
-            {"TeamNone", "No Team" },
-            {"killMsg", "{0} has killed {1}" },
-            {"noPlayers", "There are no more players in the event." },
-            {"draw", "It's a draw! No winners today" },
-            {"winner", "{0} has won the event!" }
+            ["Score.FlagCaptures"] = "Flag Captures: {0}",
+            ["Score.Kills"] = "Kills: {0}",
+            ["Score.Name"] = "Kills",
+            ["Score.Limit"] = "Score Limit : {0}",
+            ["Score.Team"] = "{0} : <color={1}>Team A</color> | <color={2}>Team B</color> : {3}",
+            ["Notification.FlagPickedUp"] = "<color={2}>{0}</color> has picked up <color={3}>Team {1}</color>'s flag",
+            ["Notification.FlagReset"] = "<color={1}>Team {0}</color>'s flag has been returned to base",
+            ["Notification.FlagCaptured"] = "<color={2}>{0}</color> has captured <color={3}>Team {1}</color>'s flag",
+            ["Notification.FlagDropped"] = "<color={2}>{0}</color> has dropped <color={3}>Team {1}</color>'s flag"
+
         };
         #endregion
-
     }
 }

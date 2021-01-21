@@ -7,8 +7,8 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("LastManStanding", "k1lly0u", "3.0.0"), Description("Last man standing event mode for EventManager")]
-    class LastManStanding : RustPlugin, IEventPlugin
+    [Info("Deathmatch", "k1lly0u", "3.0.0"), Description("Deathmatch event mode for EventManager")]
+    class Deathmatch : RustPlugin, IEventPlugin
     {
         #region Oxide Hooks
         private void OnServerInitialized()
@@ -19,7 +19,7 @@ namespace Oxide.Plugins
         }
 
         protected override void LoadDefaultMessages() => lang.RegisterMessages(Messages, this);
-
+        
         private void Unload()
         {
             if (!EventManager.IsUnloading)
@@ -30,15 +30,15 @@ namespace Oxide.Plugins
         #endregion
 
         #region Event Checks
-        public bool InitializeEvent(EventManager.EventConfig config) => EventManager.InitializeEvent<LastManStandingEvent>(this, config);
-
+        public bool InitializeEvent(EventManager.EventConfig config) => EventManager.InitializeEvent<DeathmatchEvent>(this, config);
+        
         public bool CanUseClassSelector => true;
 
         public bool RequireTimeLimit => true;
 
         public bool RequireScoreLimit => false;
 
-        public bool UseScoreLimit => false;
+        public bool UseScoreLimit => true;
 
         public bool UseTimeLimit => true;
 
@@ -46,8 +46,8 @@ namespace Oxide.Plugins
 
         public void FormatScoreEntry(EventManager.ScoreEntry scoreEntry, ulong langUserId, out string score1, out string score2)
         {
-            score1 = string.Empty;
-            score2 = string.Format(Message("Score.Kills", langUserId), scoreEntry.value2);
+            score1 = string.Format(Message("Score.Kills", langUserId), scoreEntry.value1);
+            score2 = string.Format(Message("Score.Deaths", langUserId), scoreEntry.value2);
         }
 
         public List<EventManager.EventParameter> AdditionalParameters { get; } = null;
@@ -55,22 +55,10 @@ namespace Oxide.Plugins
         public string ParameterIsValid(string fieldName, object value) => null;
         #endregion
 
-        #region Functions
-        private static string ToOrdinal(int i) => (i + "th").Replace("1th", "1st").Replace("2th", "2nd").Replace("3th", "3rd");
-        #endregion
-
         #region Event Classes
-        public class LastManStandingEvent : EventManager.BaseEventGame
+        public class DeathmatchEvent : EventManager.BaseEventGame
         {
             public EventManager.BaseEventPlayer winner;
-
-            protected override EventManager.BaseEventPlayer AddPlayerComponent(BasePlayer player) => player.gameObject.AddComponent<LastManStandingPlayer>();
-
-            internal override void PrestartEvent()
-            {
-                CloseEvent();
-                base.PrestartEvent();
-            }
 
             internal override void OnEventPlayerDeath(EventManager.BaseEventPlayer victim, EventManager.BaseEventPlayer attacker = null, HitInfo info = null)
             {
@@ -83,7 +71,7 @@ namespace Oxide.Plugins
                 {
                     attacker.OnKilledPlayer(info);
 
-                    if (GetAlivePlayerCount() <= 1)
+                    if (Config.ScoreLimit > 0 && attacker.Kills >= Config.ScoreLimit)
                     {
                         winner = attacker;
                         InvokeHandler.Invoke(this, EndEvent, 0.1f);
@@ -92,7 +80,6 @@ namespace Oxide.Plugins
                 }
 
                 UpdateScoreboard();
-
                 base.OnEventPlayerDeath(victim, attacker);
             }
 
@@ -103,6 +90,7 @@ namespace Oxide.Plugins
                     if (eventPlayers.Count > 0)
                     {
                         int kills = 0;
+                        int deaths = 0;
 
                         for (int i = 0; i < eventPlayers.Count; i++)
                         {
@@ -114,7 +102,17 @@ namespace Oxide.Plugins
                             {
                                 winner = eventPlayer;
                                 kills = eventPlayer.Kills;
-                            }                            
+                                deaths = eventPlayer.Deaths;
+                            }
+                            else if (eventPlayer.Kills == kills)
+                            {
+                                if (eventPlayer.Deaths < deaths)
+                                {
+                                    winner = eventPlayer;
+                                    kills = eventPlayer.Kills;
+                                    deaths = eventPlayer.Deaths;
+                                }
+                            }
                         }
                     }
                 }
@@ -130,48 +128,35 @@ namespace Oxide.Plugins
 
                 int index = -1;
 
-                if (Config.ScoreLimit > 0)
-                    EMInterface.CreatePanelEntry(scoreContainer, string.Format(GetMessage("Score.Remaining", 0UL), eventPlayers.Count), index += 1);
-
-                EMInterface.CreateScoreEntry(scoreContainer, string.Empty, string.Empty, "K", index += 1);
+                if (Config.ScoreLimit > 0)                
+                    EMInterface.CreatePanelEntry(scoreContainer, string.Format(GetMessage("Score.Limit", 0UL), Config.ScoreLimit), index += 1);
+                
+                EMInterface.CreateScoreEntry(scoreContainer, string.Empty, "K", "D", index += 1);
 
                 for (int i = 0; i < Mathf.Min(scoreData.Count, 15); i++)
                 {
                     EventManager.ScoreEntry score = scoreData[i];
-                    EMInterface.CreateScoreEntry(scoreContainer, score.displayName, string.Empty, ((int)score.value2).ToString(), i + index + 1);
+                    EMInterface.CreateScoreEntry(scoreContainer, score.displayName, ((int)score.value1).ToString(), ((int)score.value2).ToString(), i + index + 1);
                 }
             }
 
-            protected override float GetFirstScoreValue(EventManager.BaseEventPlayer eventPlayer) => 0;
+            protected override float GetFirstScoreValue(EventManager.BaseEventPlayer eventPlayer) => eventPlayer.Kills;
 
-            protected override float GetSecondScoreValue(EventManager.BaseEventPlayer eventPlayer) => eventPlayer.Kills;
+            protected override float GetSecondScoreValue(EventManager.BaseEventPlayer eventPlayer) => eventPlayer.Deaths;
 
             protected override void SortScores(ref List<EventManager.ScoreEntry> list)
             {
                 list.Sort(delegate (EventManager.ScoreEntry a, EventManager.ScoreEntry b)
-                {                    
-                    return a.value2.CompareTo(b.value2);
+                {
+                    int primaryScore = a.value1.CompareTo(b.value1);
+
+                    if (primaryScore == 0)
+                        return a.value2.CompareTo(b.value2) * -1;
+
+                    return primaryScore;
                 });
             }
             #endregion
-        }
-
-        private class LastManStandingPlayer : EventManager.BaseEventPlayer
-        {
-            internal override void OnPlayerDeath(EventManager.BaseEventPlayer attacker = null, float respawnTime = 5)
-            {
-                AddPlayerDeath(attacker);
-
-                DestroyUI();
-
-                int position = Event.GetAlivePlayerCount();
-
-                string message = attacker != null ? string.Format(GetMessage("UI.Death.Killed", Player.userID), attacker.Player.displayName, ToOrdinal(position + 1), position) :
-                                 IsOutOfBounds ? string.Format(GetMessage("UI.Death.OOB", Player.userID), ToOrdinal(position + 1), position) :
-                                 string.Format(GetMessage("UI.Death.Suicide", Player.userID), ToOrdinal(position + 1), position);
-
-                EMInterface.DisplayDeathScreen(this, message, false);
-            }
         }
         #endregion
 
@@ -222,17 +207,15 @@ namespace Oxide.Plugins
 
         #region Localization
         public string Message(string key, ulong playerId = 0U) => lang.GetMessage(key, this, playerId != 0U ? playerId.ToString() : null);
-
+        
         private static Func<string, ulong, string> GetMessage;
 
         private readonly Dictionary<string, string> Messages = new Dictionary<string, string>
         {
             ["Score.Kills"] = "Kills: {0}",
+            ["Score.Deaths"] = "Deaths: {0}",
             ["Score.Name"] = "Kills",
-            ["Score.Remaining"] = "Players Remaining : {0}",
-            ["UI.Death.Killed"] = "You were killed by {0}\nYou placed {1}\n{2} players remain",
-            ["UI.Death.Suicide"] = "You died...\nYou placed {1}\n{2} players remain",
-            ["UI.Death.OOB"] = "You left the playable area\nYou placed {1}\n{2} players remain",
+            ["Score.Limit"] = "Score Limit : {0}"
         };
         #endregion
     }
